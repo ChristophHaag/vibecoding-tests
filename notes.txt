@@ -1,0 +1,5 @@
+To run monado with the remote driver, use env var P_OVERRIDE_ACTIVE_CONFIG="remote" on monado-service
+Always use the env var XRT_COMPOSITOR_FORCE_XCB=1 on monado-service when not specifically running on real hardware
+monado is the default runtime due to symlink ~/projects/vibecoding-tests/monado/build/openxr_monado-dev.json -> ~/.config/openxr/1/active_runtime.json
+hello_xr is a system wide openxr test app and should be run with -G Vulkan2 arguments
+set env var XRT_NO_STDIN=1 on monado-service in non-interactive shell

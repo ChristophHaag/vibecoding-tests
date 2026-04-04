@@ -1,0 +1,6 @@
+[submodule "monado"]
+	path = monado
+	url = https://gitlab.freedesktop.org/monado/monado.git
+[submodule "openxr-simple-playground"]
+	path = openxr-simple-playground
+	url = https://gitlab.freedesktop.org/monado/demos/openxr-simple-playground.git
