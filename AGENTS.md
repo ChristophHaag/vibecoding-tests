@@ -159,7 +159,9 @@ P_OVERRIDE_ACTIVE_CONFIG=remote XRT_COMPOSITOR_FORCE_XCB=1 XRT_NO_STDIN=1 \
 MONADO_PID=$!
 
 # 2. Start the OpenXR app under test (background)
-hello_xr -G Vulkan2 &
+# Pipe sleep infinity to prevent hello_xr's "press any key" stdin read from
+# getting immediate EOF and causing it to exit.
+(sleep infinity) | hello_xr -G Vulkan2 &
 APP_PID=$!
 
 # 3. Control the simulated devices
