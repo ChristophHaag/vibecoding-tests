@@ -164,24 +164,21 @@ MONADO_PID=$!
 (sleep infinity) | hello_xr -G Vulkan2 &
 APP_PID=$!
 
-# 3. Control the simulated devices
-{
-  # Look left 45 degrees (rotate head around Y axis)
-  echo 'head 0 1.6 0  0 0.383 0 0.924'
-  echo 'send'
-
-  # Press and release right trigger
-  echo 'right_trigger 1.0'
-  echo 'right_trigger_click 1'
-  echo 'send'
-  echo 'right_trigger 0.0'
-  echo 'right_trigger_click 0'
-  echo 'send'
-
-  # Print state for verification
-  echo 'state'
-  echo 'quit'
-} | build/remote-driver-client/monado-remote-client
+# 3. Control the simulated devices — smooth 90° head sweep over 5 seconds
+python3 - <<'PYEOF' | build/remote-driver-client/monado-remote-client
+import sys, math, time
+steps = 25
+for i in range(steps + 1):
+    t = i / steps
+    half_rad = math.radians(t * 90.0 / 2.0)   # yaw right 0→90°
+    qy, qw = math.sin(half_rad), math.cos(half_rad)
+    print(f"head 0 1.6 0  0 {qy:.5f} 0 {qw:.5f}")
+    print("send")
+    sys.stdout.flush()
+    if i < steps:
+        time.sleep(0.2)
+print("quit")
+PYEOF
 
 # 4. Observe app output / take screenshot, then clean up
 kill $APP_PID $MONADO_PID
@@ -194,13 +191,76 @@ kill $APP_PID $MONADO_PID
 `hello_xr` is a system-wide OpenXR reference app:
 
 ```sh
-hello_xr -G Vulkan2
+# Must pipe stdin — without it hello_xr reads EOF on "press any key" and exits.
+(sleep infinity) | hello_xr -G Vulkan2 >/tmp/hello_xr.log 2>&1 &
+```
+
+Wait for swapchain creation before sending input:
+
+```sh
+until grep -q "Creating swapchain for view 1" /tmp/hello_xr.log 2>/dev/null; do sleep 0.2; done
 ```
 
 The `openxr-simple-playground` app (in `openxr-simple-playground/`) is a more
 feature-rich test app built with SDL2 + OpenGL.  It uses the active runtime
 symlink and exercises hand tracking, plane detection, and the
 `XR_MNDX_xdev_space` extension.
+
+### Building openxr-playground
+
+```sh
+# From the vibecoding-tests/ root — only needed once or after source changes:
+cmake -B openxr-simple-playground/build openxr-simple-playground
+cmake --build openxr-simple-playground/build
+```
+
+Binary: `openxr-simple-playground/build/openxr-playground`
+
+### Running openxr-playground
+
+Monado must be running first (see above).  The app uses SDL2 so it requires a
+display (`DISPLAY` must be set).  It reads from stdin only on exit; pipe
+`sleep infinity` to avoid immediate EOF:
+
+```sh
+# Start Monado (background), wait for it to be ready
+P_OVERRIDE_ACTIVE_CONFIG=remote XRT_COMPOSITOR_FORCE_XCB=1 XRT_NO_STDIN=1 \
+    /home/haagch-demo/projects/vibecoding-tests/monado/build/src/xrt/targets/service/monado-service \
+    >/tmp/monado.log 2>&1 &
+MONADO_PID=$!
+until grep -q "Listening on port" /tmp/monado.log 2>/dev/null; do sleep 0.2; done
+
+# Run the playground (pipe stdin so it doesn't get EOF immediately)
+LOG=/tmp/playground.log
+(sleep infinity) | openxr-simple-playground/build/openxr-playground >"$LOG" 2>&1 &
+APP_PID=$!
+```
+
+Wait for the session to reach FOCUSED state before sending input:
+
+```sh
+until grep -q "state changed from 4 to 5" "$LOG" 2>/dev/null; do sleep 0.2; done
+# "state 5" = XR_SESSION_STATE_FOCUSED — app is rendering and accepting input
+```
+
+Clean up:
+
+```sh
+kill $APP_PID $MONADO_PID
+wait
+```
+
+**Success indicators** in `$LOG`:
+- `Successfully created a session with OpenGL!`
+- `Session started!`
+- `EVENT: app->oxr.session app->oxr.state changed from 4 to 5` (FOCUSED — rendering)
+- `Cleaned up!` (after receiving SIGTERM / exit request)
+
+**Failure indicators**: any line containing `XR_ERROR`, `assert`, or `Segmentation fault`.
+
+The playground's stdout is verbose: it prints extension availability, supported
+swapchain formats, action bindings, and per-event state transitions.  Per-frame
+output is intentionally absent — silence after `Session started!` is normal.
 
 ---
 
@@ -221,6 +281,12 @@ never contains copied struct definitions.
 
 ## Notes and caveats
 
+- Before finalizing C/C++ changes, run `git clang-format` to normalize style.
+- Accept formatting edits only in project-owned code (for example
+  `openxr-simple-playground/` and `remote-driver-client/`).
+- Do not accept formatting-only edits in external or vendored code (for example
+  `openxr-simple-playground/external/` or `monado/`) unless explicitly asked.
+
 - Only one client can be connected to the remote driver at a time.  If a
   previous client crashed without disconnecting, Monado may need to be
   restarted.
@@ -228,4 +294,7 @@ never contains copied struct definitions.
   with `P_OVERRIDE_ACTIVE_CONFIG=remote`.
 - The TCP port defaults to 4242 and is not configurable at runtime (set in
   Monado's config JSON if needed; see `monado/src/xrt/targets/common/target_builder_remote.c`).
+- `hello_xr` does **not** log per-frame output, so its log going quiet after
+  swapchain creation is normal — it is in the render loop.  Use `ps` or the
+  `wchan` value `hrtimer_nanosleep` to confirm it is alive and looping.
 - All paths above are relative to the `vibecoding-tests/` repository root.
