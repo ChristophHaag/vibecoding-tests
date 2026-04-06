@@ -236,7 +236,8 @@ static void DrawStackedBar(const BarSegment *segs, int n, float total_ms, float 
 // pipeline overlap and idle gaps between frames.
 
 static void DrawTimeline(const std::vector<FramePerfRecord> &frames, float period_ms,
-                         int max_rows, float row_height, float zoom)
+                         int max_rows, float row_height, float zoom, float max_height,
+                         float *zoom_inout)
 {
     if (frames.empty())
         return;
@@ -260,7 +261,8 @@ static void DrawTimeline(const std::vector<FramePerfRecord> &frames, float perio
     // The visible area is the container width; the *content* is wider when zoomed.
     float container_w = ImGui::GetContentRegionAvail().x - 8;
     float content_w = container_w * zoom;
-    float child_h = row_height * show + 4;
+    float content_h = row_height * show + 4;
+    float child_h = std::min(content_h, max_height);
     double ns_range = (double)(t_max - t_min);
 
     // Frame number label gutter width (reserve space left of the timeline)
@@ -277,6 +279,7 @@ static void DrawTimeline(const std::vector<FramePerfRecord> &frames, float perio
 
     ImGui::BeginChild("Timeline", ImVec2(-1, child_h), true,
                        ImGuiWindowFlags_HorizontalScrollbar);
+    bool was_at_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - row_height * 2;
 
     // Set a wider content size for horizontal scrolling
     if (zoom > 1.0f)
@@ -379,6 +382,18 @@ static void DrawTimeline(const std::vector<FramePerfRecord> &frames, float perio
     }
 
     ImGui::Dummy(ImVec2(content_w, row_height * show));
+
+    // Auto-scroll to latest frames (bottom) unless user has scrolled up
+    if (was_at_bottom)
+        ImGui::SetScrollHereY(1.0f);
+
+    // Ctrl + mouse wheel to zoom the time axis
+    if (zoom_inout && ImGui::IsWindowHovered() && ImGui::GetIO().KeyCtrl) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f)
+            *zoom_inout = std::clamp(*zoom_inout * (1.0f + wheel * 0.15f), 1.0f, 100.0f);
+    }
+
     ImGui::EndChild();
 }
 
@@ -395,6 +410,7 @@ void gui_render_perf_panel(InstanceData *data)
     static int scale_mode = 0;     // 0 = period, 1 = max frame in window
     static float timeline_zoom = 1.0f;
     static float timeline_row_h = 16.0f;
+    static float timeline_max_h = 250.0f;
 
     bool panel_visible = ImGui::Begin("Performance");
     if (!panel_visible) {
@@ -506,6 +522,7 @@ void gui_render_perf_panel(InstanceData *data)
     ImGui::Separator();
 
     // ── Stacked-bar chart for last N frames ──────────────────────────
+    if (ImGui::CollapsingHeader("Frame Breakdown", ImGuiTreeNodeFlags_DefaultOpen)) {
     if (ImGui::RadioButton("Budget scale", budget_mode)) budget_mode = true;
     ImGui::SameLine();
     if (ImGui::RadioButton("Percentage", !budget_mode)) budget_mode = false;
@@ -534,10 +551,15 @@ void gui_render_perf_panel(InstanceData *data)
                 (unsigned long long)frames.front().frame_number,
                 (unsigned long long)frames.back().frame_number);
 
-    // Compute max frame time in visible window for "Max frame" scale mode.
+    float bar_region_w = ImGui::GetContentRegionAvail().x - 80; // room for marker + frame# label
+    // Limit visible bars for performance
+    int visible_bars = std::min(max_show, 150);
+    int bar_vis_start = max_show - visible_bars;
+
+    // Compute max frame time in visible bars for "Max frame" scale mode.
     float max_frame_ms = 0.0f;
-    for (auto &f : frames)
-        max_frame_ms = std::max(max_frame_ms, f.total_frame_ms);
+    for (int i = bar_vis_start; i < bar_vis_start + visible_bars; ++i)
+        max_frame_ms = std::max(max_frame_ms, frames[(size_t)i].total_frame_ms);
     float scale_ref_ms;
     if (!budget_mode)
         scale_ref_ms = period_ms; // unused in percentage mode, but safe
@@ -545,11 +567,6 @@ void gui_render_perf_panel(InstanceData *data)
         scale_ref_ms = max_frame_ms * 1.05f; // 5% padding so longest bar doesn't quite touch edge
     else
         scale_ref_ms = period_ms;
-
-    float bar_region_w = ImGui::GetContentRegionAvail().x - 80; // room for marker + frame# label
-    // Limit visible bars for performance
-    int visible_bars = std::min(max_show, 150);
-    int bar_vis_start = max_show - visible_bars;
 
     float bar_h = std::max(3.0f, std::min(8.0f, 400.0f / (float)visible_bars));
 
@@ -567,11 +584,12 @@ void gui_render_perf_panel(InstanceData *data)
                        f.frame_number, period_ms, budget_mode, scale_ref_ms);
     }
     ImGui::EndChild();
+    } // Frame Breakdown
 
     ImGui::Separator();
 
     // ── Real-time timeline ───────────────────────────────────────────
-    ImGui::Text("Real-Time Timeline");
+    if (ImGui::CollapsingHeader("Real-Time Timeline", ImGuiTreeNodeFlags_DefaultOpen)) {
     HelpTooltip(
         "Each row is one frame. The horizontal axis is wall-clock time.\n"
         "Colored rectangles show exactly when each API call started and ended.\n\n"
@@ -581,19 +599,25 @@ void gui_render_perf_panel(InstanceData *data)
         "  - Idle gaps: dark space between phases means the app or runtime is idle.\n"
         "  - VSync alignment: yellow vertical lines = predicted display times.\n\n"
         "Colors match the bar chart. Purple=SyncActions, Light purple=LocateViews.\n"
-        "Use Zoom to magnify the time axis and scroll horizontally.");
+        "Ctrl+Scroll to zoom. Scroll up/down to navigate frames.");
     ImGui::SameLine(0.0f, 20.0f);
     ImGui::SetNextItemWidth(120.0f);
-    ImGui::SliderFloat("Zoom##tl", &timeline_zoom, 1.0f, 20.0f, "%.1fx");
+    ImGui::SliderFloat("Zoom##tl", &timeline_zoom, 1.0f, 100.0f, "%.1fx");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(100.0f);
     ImGui::SliderFloat("Row H##tl", &timeline_row_h, 8.0f, 32.0f, "%.0f px");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(100.0f);
+    ImGui::SliderFloat("Height##tl", &timeline_max_h, 100.0f, 600.0f, "%.0f px");
 
-    DrawTimeline(frames, period_ms, visible_bars, timeline_row_h, timeline_zoom);
+    DrawTimeline(frames, period_ms, max_show, timeline_row_h, timeline_zoom,
+                 timeline_max_h, &timeline_zoom);
+    } // Real-Time Timeline
 
     ImGui::Separator();
 
     // ── Individual timing graphs ─────────────────────────────────────
+    if (ImGui::CollapsingHeader("Timing Graphs", ImGuiTreeNodeFlags_DefaultOpen)) {
     // All share the same X extent (max_show frames) so they're visually aligned.
     // frame_offset: index into `frames` where the shown data starts
     int frame_offset = (int)frames.size() - max_show;
@@ -670,6 +694,7 @@ void gui_render_perf_panel(InstanceData *data)
                     "Time spent querying head pose and FOV for rendering. Usually "
                     "trivial, but worth monitoring for prediction pipeline issues.",
                     buf, n, period_ms, &frames, frame_offset, small_h);
+    } // Timing Graphs
 
     // ── Legend ────────────────────────────────────────────────────────
     ImGui::Separator();
