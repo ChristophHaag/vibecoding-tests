@@ -20,6 +20,18 @@ XrResult XRAPI_CALL Layer_xrWaitFrame(XrSession session, const XrFrameWaitInfo *
         data->frame_state.predicted_display_period = frameState->predictedDisplayPeriod;
         data->frame_state.should_render = frameState->shouldRender;
         data->frame_state.frame_count++;
+
+        // Update timing ring buffer with delta between consecutive frames.
+        XrTime new_time = frameState->predictedDisplayTime;
+        if (data->frame_state.prev_display_time != 0 && new_time > 0) {
+            float delta_ms = (float)((new_time - data->frame_state.prev_display_time) * 1e-6);
+            data->frame_state.timing_deltas_ms[data->frame_state.timing_write_idx] = delta_ms;
+            data->frame_state.timing_write_idx =
+                (data->frame_state.timing_write_idx + 1) % TrackedFrameState::kMaxTimingSamples;
+            if (data->frame_state.timing_count < TrackedFrameState::kMaxTimingSamples)
+                data->frame_state.timing_count++;
+        }
+        data->frame_state.prev_display_time = new_time;
     }
 
     return result;

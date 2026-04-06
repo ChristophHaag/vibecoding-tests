@@ -177,6 +177,13 @@ struct TrackedFrameState {
     XrDuration predicted_display_period = 0;
     XrBool32 should_render = XR_FALSE;
     uint64_t frame_count = 0;
+
+    // Ring buffer of consecutive display-time deltas in milliseconds.
+    static constexpr size_t kMaxTimingSamples = 2048;
+    std::vector<float> timing_deltas_ms = std::vector<float>(kMaxTimingSamples, 0.0f);
+    size_t timing_write_idx = 0;
+    size_t timing_count = 0;
+    XrTime prev_display_time = 0;
 };
 
 // ── View poses (from xrLocateViews) ──────────────────────────────────────────

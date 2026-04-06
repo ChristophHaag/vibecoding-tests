@@ -12,15 +12,30 @@
 #include <imgui_internal.h>
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl3.h>
+#include <openxr/openxr_reflection.h>
 
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace debug_layer {
+
+// Strip "XR_SESSION_STATE_" prefix (17 chars) from the enum name.
+static const char *session_state_to_str(XrSessionState s)
+{
+#define CASE(name, val) \
+    case name: return #name + 17;
+    switch (s) {
+        XR_LIST_ENUM_XrSessionState(CASE)
+    default: return "(unknown)";
+    }
+#undef CASE
+}
 
 static void gui_render_thread_func(InstanceData *data)
 {
@@ -109,6 +124,20 @@ static void gui_render_thread_func(InstanceData *data)
     ImGui_ImplSDL3_InitForOpenGL(window, gl_ctx);
     ImGui_ImplOpenGL3_Init("#version 330");
 
+    // ── Compute CLOCK_MONOTONIC → CLOCK_REALTIME offset (once) ───────────
+    // OpenXR times on Linux/Monado are CLOCK_MONOTONIC nanoseconds.
+    // We capture both clocks close together to produce a stable offset so the
+    // predicted display time can be rendered as a wall-clock time.
+    int64_t mono_to_real_offset_ns = 0;
+    {
+        struct timespec mono, real;
+        clock_gettime(CLOCK_MONOTONIC, &mono);
+        clock_gettime(CLOCK_REALTIME, &real);
+        int64_t mono_ns = (int64_t)mono.tv_sec * 1000000000LL + mono.tv_nsec;
+        int64_t real_ns = (int64_t)real.tv_sec * 1000000000LL + real.tv_nsec;
+        mono_to_real_offset_ns = real_ns - mono_ns;
+    }
+
     // ── Set up first-run default layout ──────────────────────────────────
     // Only runs when imgui.ini doesn't exist yet.
     bool first_run = !SDL_GetPathInfo(ini_path.c_str(), nullptr);
@@ -147,6 +176,8 @@ static void gui_render_thread_func(InstanceData *data)
                                                             ImGuiDockNodeFlags_None);
 
         // ── First-run layout ─────────────────────────────────────────
+        // Simple 2-column split: 3D left (60%), all info panels tabbed right (40%).
+        // Users can freely drag tabs out of either dock node.
         if (want_initial_layout) {
             want_initial_layout = false;
 
@@ -156,19 +187,15 @@ static void gui_render_thread_func(InstanceData *data)
             SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
             ImGui::DockBuilderSetNodeSize(dockspace_id, ImVec2((float)win_w, (float)win_h));
 
-            // Split: left 55% for 3D view, right 45% for panels
             ImGuiID left_id, right_id;
-            ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.55f, &left_id, &right_id);
-
-            // Split right into top (live state + frame info) and bottom (actions + bindings)
-            ImGuiID right_top_id, right_bottom_id;
-            ImGui::DockBuilderSplitNode(right_id, ImGuiDir_Up, 0.55f, &right_top_id, &right_bottom_id);
+            ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.60f, &left_id, &right_id);
 
             ImGui::DockBuilderDockWindow("3D Spaces", left_id);
-            ImGui::DockBuilderDockWindow("Active Profiles & Live State", right_top_id);
-            ImGui::DockBuilderDockWindow("Frame Info", right_top_id);
-            ImGui::DockBuilderDockWindow("Action Sets & Actions", right_bottom_id);
-            ImGui::DockBuilderDockWindow("Suggested Bindings", right_bottom_id);
+            // All info panels land in the right node as tabs — drag any out for side-by-side.
+            ImGui::DockBuilderDockWindow("Frame Info", right_id);
+            ImGui::DockBuilderDockWindow("Active Profiles & Live State", right_id);
+            ImGui::DockBuilderDockWindow("Action Sets & Actions", right_id);
+            ImGui::DockBuilderDockWindow("Suggested Bindings", right_id);
 
             ImGui::DockBuilderFinish(dockspace_id);
         }
@@ -177,24 +204,84 @@ static void gui_render_thread_func(InstanceData *data)
         gui_render_actions_panel(data);
         gui_render_spaces_panel(data);
 
-        // ── Render frame info overlay ────────────────────────────────
+        // ── Render frame info panel ───────────────────────────────────
         {
+            // Local statics for graph settings (survive across frames).
+            static float graph_seconds = 10.0f;
+            static std::vector<float> plot_buf;
+
             std::shared_lock lock(data->state_mutex);
             ImGui::Begin("Frame Info");
+
+            // Frame counter
             ImGui::Text("Frame #%llu", (unsigned long long)data->frame_state.frame_count);
-            ImGui::Text("Predicted display time: %lld ns",
-                        (long long)data->frame_state.predicted_display_time);
+
+            // Predicted display time: raw ns + human-readable wall clock
+            XrTime xr_time = data->frame_state.predicted_display_time;
+            ImGui::Text("Predicted display: %lld ns", (long long)xr_time);
+            if (xr_time != 0) {
+                int64_t wall_ns = xr_time + mono_to_real_offset_ns;
+                int64_t wall_sec = wall_ns / 1000000000LL;
+                int ms = (int)((wall_ns % 1000000000LL) / 1000000LL);
+                if (ms < 0) { wall_sec--; ms += 1000; }
+                time_t t = (time_t)wall_sec;
+                struct tm tm_info;
+                localtime_r(&t, &tm_info);
+                ImGui::Text("           → %02d:%02d:%02d.%03d",
+                            tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ms);
+            }
+
+            // Refresh rate
+            float period_ms = 11.11f; // fallback ~90 Hz
             if (data->frame_state.predicted_display_period > 0) {
+                period_ms = (float)(data->frame_state.predicted_display_period * 1e-6);
                 double fps = 1e9 / (double)data->frame_state.predicted_display_period;
-                ImGui::Text("Target refresh: %.1f Hz", fps);
+                ImGui::Text("Target refresh: %.1f Hz (%.3f ms)", fps, period_ms);
             }
             ImGui::Text("Should render: %s",
                         data->frame_state.should_render ? "true" : "false");
 
-            // Session states
+            // Session states with human-readable enum names
             for (auto &[handle, s] : data->sessions) {
-                ImGui::Text("Session %p: state=%d", (void *)handle, (int)s.state);
+                ImGui::Text("Session: %s", session_state_to_str(s.state));
             }
+
+            ImGui::Separator();
+
+            // ── Frame timing graph ─────────────────────────────────
+            ImGui::Text("Frame timing (delta between consecutive predicted times)");
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::SliderFloat("Span##graph", &graph_seconds, 1.0f, 60.0f, "%.0f s");
+
+            size_t total = data->frame_state.timing_count;
+            if (total > 0) {
+                // How many samples span the requested time window?
+                int samples_for_span =
+                    (period_ms > 0.0f)
+                        ? (int)(graph_seconds * 1000.0f / period_ms)
+                        : (int)total;
+                int show = (int)std::min((size_t)samples_for_span, total);
+                show = std::max(show, 1);
+
+                // Extract `show` most-recent samples from ring buffer into plot_buf.
+                plot_buf.resize((size_t)show);
+                size_t kMax = TrackedFrameState::kMaxTimingSamples;
+                size_t write_idx = data->frame_state.timing_write_idx;
+                // Oldest of the `show` samples we want:
+                size_t start = (write_idx + kMax - (size_t)show) % kMax;
+                for (int i = 0; i < show; ++i)
+                    plot_buf[i] = data->frame_state.timing_deltas_ms[(start + i) % kMax];
+
+                char overlay[64];
+                snprintf(overlay, sizeof(overlay), "period %.2f ms", period_ms);
+                // Auto-scale to data; overlay shows nominal period for reference.
+                ImGui::PlotLines("##timing", plot_buf.data(), show, 0,
+                                 overlay, FLT_MAX, FLT_MAX,
+                                 ImVec2(-1.0f, 100.0f));
+            } else {
+                ImGui::TextDisabled("(waiting for frames…)");
+            }
+
             ImGui::End();
         }
 
