@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(xr_debug_gui_layer LANGUAGES C CXX)
 
+# Default to RelWithDebInfo — the layer includes ImGui which is unusably slow
+# at -O0 (AddPolyline and friends are tight vector-math loops).
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

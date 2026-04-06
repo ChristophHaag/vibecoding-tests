@@ -24,11 +24,13 @@ debug_layer/
     │   ├── session.cpp            xrCreate/Destroy/Begin/EndSession — launches GUI from xrCreateSession
     │   ├── actions.cpp            Action sets, actions, bindings, sync, state queries, profiles
     │   ├── spaces.cpp             Reference/action spaces, xrLocateSpace, xrLocateViews
-    │   └── frame.cpp              xrWaitFrame, xrBeginFrame, xrEndFrame
+    │   └── frame.cpp              xrWaitFrame, xrBeginFrame, xrEndFrame, swapchain ops (CLOCK_MONOTONIC timing)
     └── gui/
         ├── gui_main.h/.cpp        SDL3 init + ImGui setup on dedicated thread, DockBuilder layout
         ├── gui_actions.h/.cpp      Actions/bindings/live-state panels
         ├── gui_spaces.h/.cpp       3D FBO scene: grid, axes, space frames, view frustums, labels
+        ├── gui_perf.h/.cpp         Performance observatory: stacked bars (budget/percentage/max-frame scale),
+        │                           zoomable real-time timeline, 8 timing graphs with frame-number tooltips
         └── gui_common.h           Math: Vec3, Vec4, Mat4, ArcballCamera, project_to_screen
 ```
 
@@ -38,6 +40,9 @@ debug_layer/
 cmake -B build
 cmake --build build -j$(nproc)
 ```
+
+The build defaults to **RelWithDebInfo**. ImGui's draw routines (AddPolyline, etc.) are
+unusably slow at `-O0` — always build with optimizations enabled.
 
 Binary: `build/libXrApiLayer_debug_gui.so`
 Wrapper: `build/xr-with-debug-gui.sh`

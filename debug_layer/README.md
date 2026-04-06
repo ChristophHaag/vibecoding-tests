@@ -11,12 +11,21 @@ An OpenXR API layer that opens a standalone Dear ImGui window showing live debug
 - **3D space visualization** — interactive arcball scene rendering all reference spaces and action spaces as labeled coordinate frames with RGB axes
 - **HMD view frustums** — `xrLocateViews` results shown as orange wireframe FOV frustums with near-plane rectangles
 - **Label anti-overlap** — overlapping space labels are automatically nudged apart
-- **Frame info overlay** — frame count, predicted display time, refresh rate, should-render flag, session state
+- **Performance observatory** — frame lifecycle timing with CLOCK_MONOTONIC instrumentation:
+  - **Stacked-bar breakdown** — per-frame phase breakdown (xrWaitFrame / xrBeginFrame / app work / swapchain ops / xrEndFrame) with Budget or Percentage scale toggle and always-visible frame number labels
+  - **Budget scale modes** — "Period" reference (1×budget = full width) or "Max frame" reference (longest frame in window fills width, better for spotting relative differences when frames vary wildly)
+  - **Extreme outlier indicators** — frames exceeding 2× budget show "Nx" multiplier markers (e.g., `8x`)
+  - **Real-time timeline** — zoomable swim-lane view with wall-clock time axis showing pipeline overlap between frames, VSync grid, predicted display time markers, and per-row frame number labels. Adjustable zoom (1–20×) and row height (8–32 px) with horizontal scrolling
+  - **CPU headroom** — percentage of frame budget remaining after all non-wait work
+  - **Over-budget indicators** — red `!` marker on frames that exceed the display period
+  - **8 individual timing graphs** with min/max/avg overlays and frame-number hover tooltips showing current sample and frame-to-frame transition (total, wait, app work, end frame, swapchain, begin frame, sync actions, locate views)
+  - **Pause/resume** with frozen snapshot, configurable history window (1–30 s)
+- **Frame info overlay** — frame count, predicted display time (with wall-clock HH:MM:SS.mmm), refresh rate, should-render flag, session state, display time delta graph
 - **Persistent layout** — ImGui docking layout saved to `~/.config/openxr_debug_gui/imgui.ini`
 
 ## Intercepted Functions
 
-`xrCreateSession`, `xrDestroySession`, `xrBeginSession`, `xrEndSession`, `xrCreateActionSet`, `xrCreateAction`, `xrSuggestInteractionProfileBindings`, `xrAttachSessionActionSets`, `xrSyncActions`, `xrGetActionState*`, `xrGetCurrentInteractionProfile`, `xrCreateReferenceSpace`, `xrCreateActionSpace`, `xrDestroySpace`, `xrLocateSpace`, `xrLocateViews`, `xrWaitFrame`, `xrBeginFrame`, `xrEndFrame`, `xrStringToPath`, `xrPathToString`, `xrDestroyInstance`, `xrDestroyActionSet`, `xrDestroyAction`
+`xrCreateSession`, `xrDestroySession`, `xrBeginSession`, `xrEndSession`, `xrPollEvent`, `xrCreateActionSet`, `xrCreateAction`, `xrSuggestInteractionProfileBindings`, `xrAttachSessionActionSets`, `xrSyncActions`, `xrGetActionState*`, `xrGetCurrentInteractionProfile`, `xrCreateReferenceSpace`, `xrCreateActionSpace`, `xrDestroySpace`, `xrLocateSpace`, `xrLocateViews`, `xrWaitFrame`, `xrBeginFrame`, `xrEndFrame`, `xrCreateSwapchain`, `xrDestroySwapchain`, `xrAcquireSwapchainImage`, `xrWaitSwapchainImage`, `xrReleaseSwapchainImage`, `xrStringToPath`, `xrPathToString`, `xrDestroyInstance`, `xrDestroyActionSet`, `xrDestroyAction`
 
 ## Building
 
@@ -24,6 +33,8 @@ An OpenXR API layer that opens a standalone Dear ImGui window showing live debug
 cmake -B build
 cmake --build build -j$(nproc)
 ```
+
+The default build type is **RelWithDebInfo** — this is important because ImGui's draw routines are unusably slow at `-O0`.
 
 Requires: CMake ≥ 3.20, C++17 compiler, OpenGL, X11 dev headers.  
 SDL3, Dear ImGui, and OpenXR headers are fetched automatically via FetchContent.
@@ -71,8 +82,9 @@ dispatch.h/.cpp         X-macro interceptor registry + NextDispatch struct
 instance_data.h/.cpp    Per-instance state + global handle→InstanceData maps
 tracked_state.h         All tracked object structs (actions, spaces, sessions, views)
 interceptors/           One file per domain (instance, session, actions, spaces, frame)
-gui/                    SDL3 + ImGui on dedicated thread (gui_main, gui_actions, gui_spaces)
+gui/                    SDL3 + ImGui on dedicated thread (gui_main, gui_actions, gui_spaces, gui_perf)
 gui/gui_common.h        Math (Vec3, Mat4, ArcballCamera, project_to_screen)
+gui/gui_perf.h/.cpp     Performance observatory: stacked bars, real-time timeline, timing graphs
 ```
 
 ## Notes
