@@ -568,9 +568,12 @@ void gui_render_perf_panel(InstanceData *data)
     else
         scale_ref_ms = period_ms;
 
-    float bar_h = std::max(3.0f, std::min(8.0f, 400.0f / (float)visible_bars));
+    float bar_h = std::max(6.0f, std::min(14.0f, 800.0f / (float)visible_bars));
 
-    ImGui::BeginChild("BarChart", ImVec2(-1, bar_h * visible_bars + 4), true);
+    float bar_content_h = bar_h * visible_bars + 4;
+    float bar_child_h = std::min(bar_content_h, 300.0f);
+
+    ImGui::BeginChild("BarChart", ImVec2(-1, bar_child_h), true);
     for (int i = 0; i < visible_bars; ++i) {
         const auto &f = frames[(size_t)(bar_vis_start + i)];
         BarSegment segs[] = {
@@ -600,7 +603,6 @@ void gui_render_perf_panel(InstanceData *data)
         "  - VSync alignment: yellow vertical lines = predicted display times.\n\n"
         "Colors match the bar chart. Purple=SyncActions, Light purple=LocateViews.\n"
         "Ctrl+Scroll to zoom. Scroll up/down to navigate frames.");
-    ImGui::SameLine(0.0f, 20.0f);
     ImGui::SetNextItemWidth(120.0f);
     ImGui::SliderFloat("Zoom##tl", &timeline_zoom, 1.0f, 100.0f, "%.1fx");
     ImGui::SameLine();
