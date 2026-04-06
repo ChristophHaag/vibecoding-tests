@@ -13,6 +13,7 @@ std::unordered_map<XrSession, InstanceData *> g_session_map;
 std::unordered_map<XrActionSet, InstanceData *> g_action_set_map;
 std::unordered_map<XrAction, InstanceData *> g_action_map;
 std::unordered_map<XrSpace, InstanceData *> g_space_map;
+std::unordered_map<XrSwapchain, InstanceData *> g_swapchain_map;
 
 // ── Lookup helpers ───────────────────────────────────────────────────────────
 
@@ -111,6 +112,25 @@ void UnregisterSpace(XrSpace space)
 {
     std::lock_guard<std::mutex> lock(g_map_mutex);
     g_space_map.erase(space);
+}
+
+InstanceData *GetInstanceDataFromSwapchain(XrSwapchain swapchain)
+{
+    std::lock_guard<std::mutex> lock(g_map_mutex);
+    auto it = g_swapchain_map.find(swapchain);
+    return it != g_swapchain_map.end() ? it->second : nullptr;
+}
+
+void RegisterSwapchain(XrSwapchain swapchain, InstanceData *data)
+{
+    std::lock_guard<std::mutex> lock(g_map_mutex);
+    g_swapchain_map[swapchain] = data;
+}
+
+void UnregisterSwapchain(XrSwapchain swapchain)
+{
+    std::lock_guard<std::mutex> lock(g_map_mutex);
+    g_swapchain_map.erase(swapchain);
 }
 
 } // namespace debug_layer

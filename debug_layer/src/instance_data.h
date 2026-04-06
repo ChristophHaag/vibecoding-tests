@@ -37,6 +37,7 @@ struct InstanceData {
     std::unordered_map<XrSpace, TrackedSpace> spaces;
     TrackedFrameState frame_state;
     std::vector<TrackedViewPose> view_poses;
+    PerfTimeline perf;
 
     // GUI thread
     std::thread gui_thread;
@@ -55,6 +56,7 @@ extern std::unordered_map<XrSession, InstanceData *> g_session_map;
 extern std::unordered_map<XrActionSet, InstanceData *> g_action_set_map;
 extern std::unordered_map<XrAction, InstanceData *> g_action_map;
 extern std::unordered_map<XrSpace, InstanceData *> g_space_map;
+extern std::unordered_map<XrSwapchain, InstanceData *> g_swapchain_map;
 
 // ── Lookup helpers ───────────────────────────────────────────────────────────
 
@@ -63,6 +65,7 @@ InstanceData *GetInstanceDataFromSession(XrSession session);
 InstanceData *GetInstanceDataFromActionSet(XrActionSet actionSet);
 InstanceData *GetInstanceDataFromAction(XrAction action);
 InstanceData *GetInstanceDataFromSpace(XrSpace space);
+InstanceData *GetInstanceDataFromSwapchain(XrSwapchain swapchain);
 
 // ── Registration helpers (called from interceptors) ──────────────────────────
 
@@ -80,5 +83,8 @@ void UnregisterAction(XrAction action);
 
 void RegisterSpace(XrSpace space, InstanceData *data);
 void UnregisterSpace(XrSpace space);
+
+void RegisterSwapchain(XrSwapchain swapchain, InstanceData *data);
+void UnregisterSwapchain(XrSwapchain swapchain);
 
 } // namespace debug_layer

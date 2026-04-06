@@ -46,6 +46,12 @@
     X(xrDestroySpace) \
     X(xrLocateSpace) \
     X(xrLocateViews) \
+    /* Swapchains */ \
+    X(xrCreateSwapchain) \
+    X(xrDestroySwapchain) \
+    X(xrAcquireSwapchainImage) \
+    X(xrWaitSwapchainImage) \
+    X(xrReleaseSwapchainImage) \
     /* Frame */ \
     X(xrWaitFrame) \
     X(xrBeginFrame) \
@@ -147,6 +153,19 @@ XrResult XRAPI_CALL Layer_xrWaitFrame(XrSession session, const XrFrameWaitInfo *
                                        XrFrameState *frameState);
 XrResult XRAPI_CALL Layer_xrBeginFrame(XrSession session, const XrFrameBeginInfo *frameBeginInfo);
 XrResult XRAPI_CALL Layer_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo);
+
+// Swapchains
+XrResult XRAPI_CALL Layer_xrCreateSwapchain(XrSession session,
+                                             const XrSwapchainCreateInfo *createInfo,
+                                             XrSwapchain *swapchain);
+XrResult XRAPI_CALL Layer_xrDestroySwapchain(XrSwapchain swapchain);
+XrResult XRAPI_CALL Layer_xrAcquireSwapchainImage(XrSwapchain swapchain,
+                                                    const XrSwapchainImageAcquireInfo *acquireInfo,
+                                                    uint32_t *index);
+XrResult XRAPI_CALL Layer_xrWaitSwapchainImage(XrSwapchain swapchain,
+                                                 const XrSwapchainImageWaitInfo *waitInfo);
+XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(XrSwapchain swapchain,
+                                                    const XrSwapchainImageReleaseInfo *releaseInfo);
 
 // Special: our xrGetInstanceProcAddr (also registered, but handled specially)
 XrResult XRAPI_CALL Layer_xrGetInstanceProcAddr(XrInstance instance, const char *name,

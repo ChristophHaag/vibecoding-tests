@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
-// interceptors/spaces.cpp — Reference/Action spaces, xrLocateSpace.
+// interceptors/spaces.cpp — Reference/Action spaces, xrLocateSpace, xrLocateViews.
 
 #include "../dispatch.h"
 #include "../instance_data.h"
 
+#include <ctime>
 #include <iostream>
 #include <string>
 
@@ -176,9 +177,12 @@ XrResult XRAPI_CALL Layer_xrLocateViews(XrSession session,
     if (data == nullptr)
         return XR_ERROR_HANDLE_INVALID;
 
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
     XrResult result =
         data->next.xrLocateViews(session, viewLocateInfo, viewState, viewCapacityInput,
                                  viewCountOutput, views);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
 
     if (XR_SUCCEEDED(result) && views != nullptr && viewCountOutput != nullptr &&
         viewState != nullptr) {
@@ -186,6 +190,9 @@ XrResult XRAPI_CALL Layer_xrLocateViews(XrSession session,
             (viewState->viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
         bool orient_valid =
             (viewState->viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+
+        int64_t t0 = (int64_t)ts0.tv_sec * 1000000000LL + ts0.tv_nsec;
+        int64_t t1 = (int64_t)ts1.tv_sec * 1000000000LL + ts1.tv_nsec;
 
         std::unique_lock lock(data->state_mutex);
         uint32_t count = *viewCountOutput;
@@ -196,6 +203,11 @@ XrResult XRAPI_CALL Layer_xrLocateViews(XrSession session,
             data->view_poses[i].pose = views[i].pose;
             data->view_poses[i].fov = views[i].fov;
             data->view_poses[i].label = "View " + std::to_string(i);
+        }
+
+        if (data->perf.has_current) {
+            data->perf.current.locate_views_call_ts = t0;
+            data->perf.current.locate_views_return_ts = t1;
         }
     }
 

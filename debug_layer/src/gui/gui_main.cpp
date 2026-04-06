@@ -3,6 +3,7 @@
 
 #include "gui_main.h"
 #include "gui_actions.h"
+#include "gui_perf.h"
 #include "gui_spaces.h"
 #include "../instance_data.h"
 
@@ -192,6 +193,7 @@ static void gui_render_thread_func(InstanceData *data)
 
             ImGui::DockBuilderDockWindow("3D Spaces", left_id);
             // All info panels land in the right node as tabs — drag any out for side-by-side.
+            ImGui::DockBuilderDockWindow("Performance", right_id);
             ImGui::DockBuilderDockWindow("Frame Info", right_id);
             ImGui::DockBuilderDockWindow("Active Profiles & Live State", right_id);
             ImGui::DockBuilderDockWindow("Action Sets & Actions", right_id);
@@ -203,6 +205,7 @@ static void gui_render_thread_func(InstanceData *data)
         // ── Render panels ────────────────────────────────────────────
         gui_render_actions_panel(data);
         gui_render_spaces_panel(data);
+        gui_render_perf_panel(data);
 
         // ── Render frame info panel ───────────────────────────────────
         {

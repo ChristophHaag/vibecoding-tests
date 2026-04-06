@@ -5,6 +5,7 @@
 #include "../instance_data.h"
 
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <unordered_set>
 
@@ -285,9 +286,23 @@ XrResult XRAPI_CALL Layer_xrSyncActions(XrSession session, const XrActionsSyncIn
     if (data == nullptr)
         return XR_ERROR_HANDLE_INVALID;
 
+    // Time the actual runtime call
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
     XrResult result = data->next.xrSyncActions(session, syncInfo);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
     if (XR_FAILED(result) && result != XR_SESSION_NOT_FOCUSED)
         return result;
+
+    {
+        int64_t t0 = (int64_t)ts0.tv_sec * 1000000000LL + ts0.tv_nsec;
+        int64_t t1 = (int64_t)ts1.tv_sec * 1000000000LL + ts1.tv_nsec;
+        std::unique_lock lock(data->state_mutex);
+        if (data->perf.has_current) {
+            data->perf.current.sync_actions_call_ts = t0;
+            data->perf.current.sync_actions_return_ts = t1;
+        }
+    }
 
     // After a successful sync, query all tracked action states
     // We need to iterate actions outside the state lock (to call next-layer functions)

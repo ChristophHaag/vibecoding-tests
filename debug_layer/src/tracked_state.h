@@ -11,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <deque>
 
 namespace debug_layer {
 
@@ -193,6 +194,80 @@ struct TrackedViewPose {
     XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}};
     XrFovf fov = {0, 0, 0, 0};
     std::string label;
+};
+
+// ── Performance timing (per-frame call timings) ──────────────────────────────
+// All timestamps are CLOCK_MONOTONIC nanoseconds, consistent with XrTime.
+
+struct SwapchainTiming {
+    int64_t acquire_call_ts = 0; // when app called xrAcquireSwapchainImage
+    int64_t acquire_done_ts = 0; // when runtime returned from acquire
+    int64_t wait_call_ts = 0;    // when app called xrWaitSwapchainImage
+    int64_t wait_done_ts = 0;    // when runtime returned from wait
+    int64_t release_ts = 0;      // when app called xrReleaseSwapchainImage
+    int64_t release_done_ts = 0; // when runtime returned from release
+};
+
+struct FramePerfRecord {
+    uint64_t frame_number = 0;
+
+    // xrWaitFrame
+    int64_t wait_frame_call_ts = 0;    // app calls xrWaitFrame
+    int64_t wait_frame_return_ts = 0;  // runtime unblocks (returns)
+    XrTime predicted_display_time = 0;
+    XrDuration predicted_display_period = 0;
+
+    // xrBeginFrame
+    int64_t begin_frame_call_ts = 0;
+    int64_t begin_frame_return_ts = 0;
+
+    // Swapchains (one per swapchain used this frame; typically 2 for stereo)
+    std::vector<SwapchainTiming> swapchains;
+
+    // xrEndFrame
+    int64_t end_frame_call_ts = 0;
+    int64_t end_frame_return_ts = 0;
+
+    // xrSyncActions / xrLocateViews (useful to see CPU work between begin/end)
+    int64_t sync_actions_call_ts = 0;
+    int64_t sync_actions_return_ts = 0;
+    int64_t locate_views_call_ts = 0;
+    int64_t locate_views_return_ts = 0;
+
+    // Derived durations (computed once when end_frame returns), all in ms.
+    float wait_frame_ms = 0.0f;   // how long runtime blocked the app
+    float begin_frame_ms = 0.0f;
+    float end_frame_ms = 0.0f;
+    float app_work_ms = 0.0f;     // begin_frame return → end_frame call (CPU render prep)
+    float total_frame_ms = 0.0f;  // wait_frame call → end_frame return (full frame)
+    float sync_actions_ms = 0.0f;
+    float locate_views_ms = 0.0f;
+    float swapchain_acquire_wait_ms = 0.0f; // sum of all acquire+wait across swapchains
+};
+
+struct PerfTimeline {
+    static constexpr size_t kMaxFrames = 2048;
+    std::deque<FramePerfRecord> frames;
+
+    // In-progress frame being built (not yet in `frames`)
+    FramePerfRecord current;
+    bool has_current = false;
+
+    // Pause state: when paused, new frames still record into current/frames
+    // but the GUI reads from a frozen snapshot.
+    bool paused = false;
+    std::deque<FramePerfRecord> frozen_frames; // snapshot when paused
+
+    void push_completed_frame()
+    {
+        if (!has_current)
+            return;
+        frames.push_back(std::move(current));
+        if (frames.size() > kMaxFrames)
+            frames.pop_front();
+        current = {};
+        has_current = false;
+    }
 };
 
 } // namespace debug_layer

@@ -73,6 +73,7 @@ add_library(XrApiLayer_debug_gui SHARED
     src/interceptors/frame.cpp
     src/gui/gui_main.cpp
     src/gui/gui_actions.cpp
+    src/gui/gui_perf.cpp
     src/gui/gui_spaces.cpp
 )
 
