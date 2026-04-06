@@ -26,6 +26,7 @@
     X(xrDestroySession) \
     X(xrBeginSession) \
     X(xrEndSession) \
+    X(xrPollEvent) \
     /* Action sets & actions */ \
     X(xrCreateActionSet) \
     X(xrDestroyActionSet) \
@@ -94,6 +95,7 @@ XrResult XRAPI_CALL Layer_xrCreateSession(XrInstance instance,
 XrResult XRAPI_CALL Layer_xrDestroySession(XrSession session);
 XrResult XRAPI_CALL Layer_xrBeginSession(XrSession session, const XrSessionBeginInfo *beginInfo);
 XrResult XRAPI_CALL Layer_xrEndSession(XrSession session);
+XrResult XRAPI_CALL Layer_xrPollEvent(XrInstance instance, XrEventDataBuffer *eventData);
 
 // Action sets & actions
 XrResult XRAPI_CALL Layer_xrCreateActionSet(XrInstance instance,

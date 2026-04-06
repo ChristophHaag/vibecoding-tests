@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// interceptors/session.cpp — xrCreate/Destroy/Begin/EndSession
+// interceptors/session.cpp — xrCreate/Destroy/Begin/EndSession, xrPollEvent
 
 #include "../dispatch.h"
 #include "../gui/gui_main.h"
@@ -10,6 +10,9 @@
 #include <iostream>
 
 namespace debug_layer {
+
+// Forward declaration of helper defined in actions.cpp.
+void refresh_active_profiles(InstanceData *data, XrSession session);
 
 XrResult XRAPI_CALL Layer_xrCreateSession(XrInstance instance,
                                            const XrSessionCreateInfo *createInfo,
@@ -82,16 +85,7 @@ XrResult XRAPI_CALL Layer_xrBeginSession(XrSession session, const XrSessionBegin
     if (data == nullptr)
         return XR_ERROR_HANDLE_INVALID;
 
-    XrResult result = data->next.xrBeginSession(session, beginInfo);
-
-    if (XR_SUCCEEDED(result)) {
-        std::unique_lock lock(data->state_mutex);
-        auto it = data->sessions.find(session);
-        if (it != data->sessions.end())
-            it->second.state = XR_SESSION_STATE_READY;
-    }
-
-    return result;
+    return data->next.xrBeginSession(session, beginInfo);
 }
 
 XrResult XRAPI_CALL Layer_xrEndSession(XrSession session)
@@ -100,13 +94,38 @@ XrResult XRAPI_CALL Layer_xrEndSession(XrSession session)
     if (data == nullptr)
         return XR_ERROR_HANDLE_INVALID;
 
-    XrResult result = data->next.xrEndSession(session);
+    return data->next.xrEndSession(session);
+}
 
-    if (XR_SUCCEEDED(result)) {
+// ── xrPollEvent ──────────────────────────────────────────────────────────────
+
+XrResult XRAPI_CALL Layer_xrPollEvent(XrInstance instance, XrEventDataBuffer *eventData)
+{
+    InstanceData *data = GetInstanceData(instance);
+    if (data == nullptr)
+        return XR_ERROR_HANDLE_INVALID;
+
+    XrResult result = data->next.xrPollEvent(instance, eventData);
+    if (result != XR_SUCCESS)
+        return result;
+
+    switch (eventData->type) {
+    case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+        // Track session state properly via events rather than guessing from API calls.
+        auto *ev = reinterpret_cast<const XrEventDataSessionStateChanged *>(eventData);
         std::unique_lock lock(data->state_mutex);
-        auto it = data->sessions.find(session);
+        auto it = data->sessions.find(ev->session);
         if (it != data->sessions.end())
-            it->second.state = XR_SESSION_STATE_STOPPING;
+            it->second.state = ev->state;
+        break;
+    }
+    case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED: {
+        // Refresh active profiles immediately when the runtime notifies us.
+        auto *ev = reinterpret_cast<const XrEventDataInteractionProfileChanged *>(eventData);
+        refresh_active_profiles(data, ev->session);
+        break;
+    }
+    default: break;
     }
 
     return result;

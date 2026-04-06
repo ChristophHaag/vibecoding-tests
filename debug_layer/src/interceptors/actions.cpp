@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <iostream>
+#include <unordered_set>
 
 namespace debug_layer {
 
@@ -233,6 +234,49 @@ XrResult XRAPI_CALL Layer_xrAttachSessionActionSets(XrSession session,
     return result;
 }
 
+// ── refresh_active_profiles ───────────────────────────────────────────────────
+// Queries xrGetCurrentInteractionProfile for all top-level user paths observed
+// in tracked actions (subaction_paths) and updates data->active_profiles.
+// Called from xrSyncActions (every frame) and Layer_xrPollEvent (on event).
+// Must NOT be called while holding data->state_mutex.
+
+void refresh_active_profiles(InstanceData *data, XrSession session)
+{
+    // Collect all distinct subaction paths used by any tracked action.
+    std::vector<XrPath> subaction_paths;
+    {
+        std::shared_lock lock(data->state_mutex);
+        std::unordered_set<XrPath> seen;
+        for (auto &[h, a] : data->actions) {
+            for (XrPath p : a.subaction_paths) {
+                if (p != XR_NULL_PATH && seen.insert(p).second)
+                    subaction_paths.push_back(p);
+            }
+        }
+    }
+
+    if (subaction_paths.empty())
+        return;
+
+    std::vector<TrackedActiveProfile> new_profiles;
+    for (XrPath up : subaction_paths) {
+        XrInteractionProfileState ps = {XR_TYPE_INTERACTION_PROFILE_STATE};
+        if (XR_SUCCEEDED(data->next.xrGetCurrentInteractionProfile(session, up, &ps))) {
+            TrackedActiveProfile tap;
+            tap.subaction_path = up;
+            tap.interaction_profile = ps.interactionProfile;
+            tap.subaction_string = resolve_path(data, up);
+            tap.profile_string = (ps.interactionProfile != XR_NULL_PATH)
+                                     ? resolve_path(data, ps.interactionProfile)
+                                     : "<none>";
+            new_profiles.push_back(tap);
+        }
+    }
+
+    std::unique_lock lock(data->state_mutex);
+    data->active_profiles = std::move(new_profiles);
+}
+
 // ── xrSyncActions ────────────────────────────────────────────────────────────
 
 XrResult XRAPI_CALL Layer_xrSyncActions(XrSession session, const XrActionsSyncInfo *syncInfo)
@@ -328,43 +372,14 @@ XrResult XRAPI_CALL Layer_xrSyncActions(XrSession session, const XrActionsSyncIn
         }
     }
 
-    // Also query active interaction profiles
-    std::vector<TrackedActiveProfile> new_profiles;
-    {
-        // Gather known top-level user paths
-        XrPath user_paths[2] = {XR_NULL_PATH, XR_NULL_PATH};
-        {
-            std::shared_lock lock(data->state_mutex);
-            user_paths[0] = data->paths.get_path("/user/hand/left");
-            user_paths[1] = data->paths.get_path("/user/hand/right");
-        }
-
-        for (auto up : user_paths) {
-            if (up == XR_NULL_PATH)
-                continue;
-            XrInteractionProfileState profileState = {XR_TYPE_INTERACTION_PROFILE_STATE};
-            if (XR_SUCCEEDED(
-                    data->next.xrGetCurrentInteractionProfile(session, up, &profileState))) {
-                TrackedActiveProfile tap;
-                tap.subaction_path = up;
-                tap.interaction_profile = profileState.interactionProfile;
-                tap.subaction_string = resolve_path(data, up);
-                if (profileState.interactionProfile != XR_NULL_PATH)
-                    tap.profile_string = resolve_path(data, profileState.interactionProfile);
-                else
-                    tap.profile_string = "<none>";
-                new_profiles.push_back(tap);
-            }
-        }
-    }
-
-    // Write all results under a single lock
+    // Write action states under lock, then refresh interaction profiles.
     {
         std::unique_lock lock(data->state_mutex);
         for (auto &[key, state] : new_states)
             data->action_states[key] = state;
-        data->active_profiles = std::move(new_profiles);
     }
+
+    refresh_active_profiles(data, session);
 
     return result;
 }

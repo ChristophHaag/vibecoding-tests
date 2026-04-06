@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <shared_mutex>
+#include <unordered_map>
 
 namespace debug_layer {
 
@@ -132,8 +133,48 @@ void gui_render_actions_panel(InstanceData *data)
     if (data->suggested_bindings.empty()) {
         ImGui::TextDisabled("No bindings suggested yet.");
     } else {
+        // Build a map: profile string → list of subaction path strings that are
+        // currently using that profile.  Used to highlight active tree nodes.
+        std::unordered_map<std::string, std::vector<std::string>> profile_to_subpaths;
+        for (auto &ap : data->active_profiles) {
+            if (ap.profile_string != "<none>" && !ap.profile_string.empty())
+                profile_to_subpaths[ap.profile_string].push_back(ap.subaction_string);
+        }
+
         for (auto &sb : data->suggested_bindings) {
-            if (ImGui::TreeNode(sb.interaction_profile.c_str())) {
+            auto pit = profile_to_subpaths.find(sb.interaction_profile);
+            bool is_active = pit != profile_to_subpaths.end();
+
+            // Build display label — show active badge with short subpath names.
+            char label_buf[512];
+            if (is_active) {
+                std::string subpaths_str;
+                for (size_t i = 0; i < pit->second.size(); ++i) {
+                    if (i > 0)
+                        subpaths_str += ", ";
+                    // Shorten /user/hand/left → left
+                    auto sl = pit->second[i].rfind('/');
+                    subpaths_str += (sl != std::string::npos)
+                                        ? pit->second[i].substr(sl + 1)
+                                        : pit->second[i];
+                }
+                snprintf(label_buf, sizeof(label_buf), "● ACTIVE [%s]   %s",
+                         subpaths_str.c_str(), sb.interaction_profile.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.3f, 1.0f));
+            } else {
+                snprintf(label_buf, sizeof(label_buf), "○  %s",
+                         sb.interaction_profile.c_str());
+            }
+
+            // Use stable ID (raw profile path) so ImGui doesn't reset open/close.
+            bool open = ImGui::TreeNodeEx(sb.interaction_profile.c_str(),
+                                          is_active ? ImGuiTreeNodeFlags_DefaultOpen : 0,
+                                          "%s", label_buf);
+
+            if (is_active)
+                ImGui::PopStyleColor();
+
+            if (open) {
                 if (ImGui::BeginTable("Bindings", 2,
                                       ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable |
                                           ImGuiTableFlags_RowBg)) {
