@@ -18,33 +18,36 @@ namespace debug_layer {
 // One InstanceData exists per XrInstance created through the layer.
 
 struct InstanceData {
-    XrInstance instance = XR_NULL_HANDLE;
-    NextDispatch next = {};
+  XrInstance instance = XR_NULL_HANDLE;
+  NextDispatch next = {};
 
-    // Protects all tracked state below.  GUI thread takes shared_lock (read),
-    // interceptors take unique_lock (write).
-    mutable std::shared_mutex state_mutex;
+  // Protects all tracked state below.  GUI thread takes shared_lock (read),
+  // interceptors take unique_lock (write).
+  mutable std::shared_mutex state_mutex;
 
-    // Tracked state
-    TrackedPath paths;
-    std::unordered_map<XrActionSet, TrackedActionSet> action_sets;
-    std::unordered_map<XrAction, TrackedAction> actions;
-    std::vector<TrackedSuggestedBindings> suggested_bindings;
-    std::unordered_map<ActionStateKey, TrackedActionState, ActionStateKeyHash> action_states;
-    std::vector<TrackedActiveProfile> active_profiles;
+  // Tracked state
+  TrackedPath paths;
+  std::unordered_map<XrActionSet, TrackedActionSet> action_sets;
+  std::unordered_map<XrAction, TrackedAction> actions;
+  std::vector<TrackedSuggestedBindings> suggested_bindings;
+  std::unordered_map<ActionStateKey, TrackedActionState, ActionStateKeyHash>
+      action_states;
+  std::vector<TrackedActiveProfile> active_profiles;
 
-    std::unordered_map<XrSession, TrackedSession> sessions;
-    std::unordered_map<XrSpace, TrackedSpace> spaces;
-    TrackedFrameState frame_state;
-    std::vector<TrackedViewPose> view_poses;
-    PerfTimeline perf;
+  std::unordered_map<XrSession, TrackedSession> sessions;
+  std::unordered_map<XrSpace, TrackedSpace> spaces;
+  std::unordered_map<XrSwapchain, TrackedSwapchain> swapchains;
+  TrackedFrameState frame_state;
+  std::vector<TrackedViewPose> view_poses;
+  std::deque<TrackedCompositionFrame> composition_frames;
+  PerfTimeline perf;
 
-    // GUI thread
-    std::thread gui_thread;
-    std::atomic<bool> gui_running{false};
+  // GUI thread
+  std::thread gui_thread;
+  std::atomic<bool> gui_running{false};
 
-    // Helpers
-    std::string path_to_string(XrPath p) const { return paths.get_string(p); }
+  // Helpers
+  std::string path_to_string(XrPath p) const { return paths.get_string(p); }
 };
 
 // ── Global handle maps ───────────────────────────────────────────────────────

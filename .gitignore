@@ -1,0 +1,9 @@
+# Local build output
+/build/
+/build-*/
+/debug_layer/build/
+/debug_layer/build-*/
+/remote-driver-client/build/
+/remote-driver-client/build-*/
+/openxr-simple-playground/build/
+/openxr-simple-playground/build-*/

@@ -258,6 +258,33 @@ is proportional to features added, not to spec growth.
 **Synchronization:** `std::shared_mutex` per `InstanceData`.  The GUI thread
 acquires a shared (read) lock when rendering; interceptors acquire a unique
 (write) lock when updating tracked state.  Contention is minimal because:
+
+---
+
+## 7. Composition Layer Preview Architecture
+
+### Decision: **Track submitted layers, capture OpenGL previews on release, and cache previews per swapchain image**
+
+**Reasons:**
+
+1. **Pointer lifetime safety.** `xrEndFrame` layer arrays and chained structs are owned by the application, so the layer deep-copies the relevant composition-layer state before returning.
+2. **Correct GL ownership.** Reading swapchain textures is safest on the application thread before `xrReleaseSwapchainImage`, where the image is still owned by the app and the app's GL context is current.
+3. **Index-rotation stability.** Many apps rotate through swapchain image indices. Caching only a single newest preview per swapchain caused flicker when the GUI happened to inspect a different sub-image than the last released one. The cache is therefore keyed by `(swapchain, image index, array index)`.
+4. **UI stability.** Some apps omit a composition layer from individual `xrEndFrame` calls. The Composition Layers panel retains recently seen layers for a few frames and marks them stale instead of dropping them immediately.
+
+**Current limits:**
+
+- Desktop OpenGL and `XR_MNDX_egl_enable` sessions only.
+- Cube and multi-face swapchains are metadata-only.
+- Array swapchains currently preview layer 0 only.
+- The capture path uses blit + readback for debuggability, not zero-copy presentation.
+
+**Implication for future work:**
+
+Any Vulkan/D3D extension of this feature should preserve the same high-level model:
+- snapshot tracked layer submissions at `xrEndFrame`
+- capture or import preview content at a synchronization-safe point for that API
+- cache previews per concrete submitted sub-image
 - Write locks are brief (just updating a struct field)
 - The GUI reads at 30 fps
 - Most interceptors are called at 72-120 fps (frame rate), so writes are

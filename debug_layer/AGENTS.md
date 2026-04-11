@@ -37,15 +37,18 @@ debug_layer/
 ## Building
 
 ```sh
-cmake -B build
-cmake --build build -j$(nproc)
+cmake -G Ninja -B build-ninja
+cmake --build build-ninja -j$(nproc)
 ```
 
 The build defaults to **RelWithDebInfo**. ImGui's draw routines (AddPolyline, etc.) are
 unusably slow at `-O0` — always build with optimizations enabled.
 
-Binary: `build/libXrApiLayer_debug_gui.so`
-Wrapper: `build/xr-with-debug-gui.sh`
+Binary: `build-ninja/libXrApiLayer_debug_gui.so`
+Wrapper: `build-ninja/xr-with-debug-gui.sh`
+
+Prefer Ninja for agent-created builds.  Avoid generating fresh build output in
+tracked `build/` directories when an untracked `build-ninja/` tree will do.
 
 No external dependencies beyond system OpenGL + X11 dev headers. SDL3, Dear ImGui (docking branch), and OpenXR-SDK headers are fetched via CMake FetchContent.
 
@@ -79,6 +82,10 @@ The X-macro automatically generates:
 4. Populate from the interceptor under `std::unique_lock lock(data->state_mutex)`.
 5. Read from GUI under `std::shared_lock lock(data->state_mutex)`.
 
+Tracked composition-layer previews currently follow two important rules:
+- Preview images are cached per `(swapchain, image index, array index)` instead of one global "latest" preview for a swapchain. Keep that model if you expand previewing to more APIs.
+- The GUI should tolerate temporarily missing `xrEndFrame` layers by retaining recent layer submissions for a few frames and marking them stale instead of dropping them immediately.
+
 ## Adding a GUI panel
 
 1. Create `gui/gui_newpanel.h` and `gui/gui_newpanel.cpp`.
@@ -86,6 +93,11 @@ The X-macro automatically generates:
 3. Call it from `gui_main.cpp`'s render loop.
 4. Add the window name to the `DockBuilder` layout in `gui_main.cpp` (under `want_initial_layout`).
 5. Add both files to `add_library()` in `CMakeLists.txt`.
+
+If the user already has an existing `imgui.ini`, the first-run dock builder will
+not run.  New panels should also set a default dock target with
+`ImGui::SetNextWindowDockID(..., ImGuiCond_Appearing)` so they land inside the
+main dockspace instead of floating.
 
 ## Threading model
 
@@ -100,6 +112,27 @@ The X-macro automatically generates:
 - The version script `XrApiLayer_debug_gui.map` ensures only `xrNegotiateLoaderApiLayerInterface` is exported. Verify with `nm -D build/libXrApiLayer_debug_gui.so | grep -w T`.
 - ImGui docking branch is required (tag pattern: `v*-docking`). The `DockBuilder` API is from `imgui_internal.h`.
 - Layout persistence: `~/.config/openxr_debug_gui/imgui.ini`. Delete to reset.
+- OpenGL preview capture happens on the application thread before `xrReleaseSwapchainImage`, not on the GUI thread. This is deliberate to avoid cross-context ownership issues.
+- Do not use `SDL_GL_GetProcAddress` on application threads for swapchain preview capture. Use direct GL/EGL/GLX proc lookup because SDL may not be initialized there.
+- `XR_TYPE_GRAPHICS_BINDING_EGL_MNDX` should be treated as desktop OpenGL for preview eligibility and UI labeling.
+- Current preview support is intentionally limited to OpenGL color swapchains; non-color swapchains, cube faces, and non-OpenGL sessions remain metadata-only.
+
+## Composition Layers Panel
+
+- The Composition Layers panel renders a retained live set built from recent `xrEndFrame` submissions instead of only `composition_frames.back()`.
+- Keep the non-inspect preview layout height stable even when a preview is missing, otherwise the details below will visibly jump during runtime.
+- Preview debug logging is controlled by `XR_DEBUG_GUI_GL_PREVIEW_LOG`:
+    - `0`: silent
+    - `1`: first success and distinct failure/skip reasons per swapchain
+    - `2`: every attempt
+- When extending previews to array swapchains, keep array index in both the preview cache key and the GUI texture cache key.
+
+## 3D Composition Rendering
+
+- The existing 3D Spaces panel already owns a dedicated GL FBO, camera, and line renderer; composition-layer world rendering should build on that instead of opening a second scene panel.
+- Projection views should be visualized using the tracked `view.pose` + `view.fov` geometry, with textured surfaces placed on the far plane of the displayed frustum.
+- Quad layers should be visualized as textured rectangles transformed by the layer pose and size in the layer's tracked space.
+- Expect multiple composition layers to reuse the same swapchain image across frames; do not assume every frame produces a new preview.
 
 ## Testing
 
@@ -120,3 +153,6 @@ Layer log messages go to stderr with prefix `[XR_APILAYER_DEBUG_gui]`.
 ## Style
 
 Run `git clang-format` before committing. Only format project-owned code, not fetched dependencies.
+
+If `git clang-format` refuses to run because the file is unstaged, use
+`clang-format -i` on the touched project-owned files instead and rebuild.

@@ -43,18 +43,22 @@ after a Monado protocol change picks up the new layout automatically.
 From the repository root (only needs to be done once, or after source changes):
 
 ```sh
-cmake -B build
-cmake --build build
+cmake -G Ninja -B build-ninja
+cmake --build build-ninja
 ```
 
-Binary: `build/remote-driver-client/monado-remote-client`
+Binary: `build-ninja/remote-driver-client/monado-remote-client`
+
+Prefer Ninja for agent-driven builds.  Do not generate fresh build output into
+tracked `build/` directories when an untracked `build-ninja/` or similar build
+tree is an option.
 
 `monado/build` must already exist (generated headers live there).  To build
 Monado itself from scratch:
 
 ```sh
-cmake -B monado/build monado
-cmake --build monado/build
+cmake -G Ninja -B monado/build-ninja monado
+cmake --build monado/build-ninja
 ```
 
 ---
@@ -210,11 +214,11 @@ symlink and exercises hand tracking, plane detection, and the
 
 ```sh
 # From the vibecoding-tests/ root — only needed once or after source changes:
-cmake -B openxr-simple-playground/build openxr-simple-playground
-cmake --build openxr-simple-playground/build
+cmake -G Ninja -B openxr-simple-playground/build-ninja openxr-simple-playground
+cmake --build openxr-simple-playground/build-ninja
 ```
 
-Binary: `openxr-simple-playground/build/openxr-playground`
+Binary: `openxr-simple-playground/build-ninja/openxr-playground`
 
 ### Running openxr-playground
 
@@ -232,7 +236,7 @@ until grep -q "Listening on port" /tmp/monado.log 2>/dev/null; do sleep 0.2; don
 
 # Run the playground (pipe stdin so it doesn't get EOF immediately)
 LOG=/tmp/playground.log
-(sleep infinity) | openxr-simple-playground/build/openxr-playground >"$LOG" 2>&1 &
+(sleep infinity) | openxr-simple-playground/build-ninja/openxr-playground >"$LOG" 2>&1 &
 APP_PID=$!
 ```
 
@@ -282,6 +286,11 @@ never contains copied struct definitions.
 ## Notes and caveats
 
 - Before finalizing C/C++ changes, run `git clang-format` to normalize style.
+- Build output should stay ignored.  If you introduce a new local build tree,
+  update `.gitignore` instead of leaving generated files visible to Git.
+- New ImGui panels added to the debug UI should set a default dock target even
+  when an existing `imgui.ini` is present; the first-run dock builder only
+  handles brand-new layouts.
 - Accept formatting edits only in project-owned code (for example
   `openxr-simple-playground/` and `remote-driver-client/`).
 - Do not accept formatting-only edits in external or vendored code (for example
