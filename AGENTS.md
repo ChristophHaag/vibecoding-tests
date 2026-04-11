@@ -205,6 +205,30 @@ Wait for swapchain creation before sending input:
 until grep -q "Creating swapchain for view 1" /tmp/hello_xr.log 2>/dev/null; do sleep 0.2; done
 ```
 
+### Running hello_xr through debug_layer with Vulkan validation
+
+When smoke-testing `debug_layer`'s Vulkan preview path, prefer the Ninja wrapper
+so `XR_API_LAYER_PATH` points at the manifest-only build directory:
+
+```sh
+# Start Monado first as described above, then run hello_xr through the layer.
+sleep infinity | env \
+  VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+  XR_DEBUG_GUI_PREVIEW_LOG=1 \
+  XR_DEBUG_GUI_PREVIEW_INTERVAL=1 \
+  stdbuf -oL -eL \
+  debug_layer/build-ninja/xr-with-debug-gui.sh --no-gui /usr/bin/hello_xr -G Vulkan2 \
+  2>&1 | tee /tmp/hello_xr_vulkan_validation.log
+
+rg -n "Captured Vulkan preview|VUID|Validation Error|ERROR:" /tmp/hello_xr_vulkan_validation.log
+```
+
+Success indicators in the log:
+- `XR_SESSION_STATE_VISIBLE->XR_SESSION_STATE_FOCUSED`
+- `[XR_APILAYER_DEBUG_gui][preview] ... status="Captured Vulkan preview"`
+
+Failure indicators: any `VUID`, `Validation Error`, or `ERROR:` line.
+
 The `openxr-simple-playground` app (in `openxr-simple-playground/`) is a more
 feature-rich test app built with SDL2 + OpenGL.  It uses the active runtime
 symlink and exercises hand tracking, plane detection, and the

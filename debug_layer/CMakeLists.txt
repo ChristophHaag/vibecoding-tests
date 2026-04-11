@@ -66,6 +66,7 @@ set_target_properties(imgui_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ── Find OpenGL ───────────────────────────────────────────────────────────────
 find_package(OpenGL REQUIRED)
+find_package(Vulkan REQUIRED)
 
 # ── Layer shared library ─────────────────────────────────────────────────────
 add_library(XrApiLayer_debug_gui SHARED
@@ -98,6 +99,7 @@ target_link_libraries(XrApiLayer_debug_gui PRIVATE
     imgui_lib
     SDL3::SDL3
     OpenGL::GL
+    Vulkan::Vulkan
 )
 
 # ── Linker: export only the negotiate symbol ──────────────────────────────────

@@ -12,6 +12,7 @@ An OpenXR API layer that opens a standalone Dear ImGui window showing live debug
 - **HMD view frustums** — `xrLocateViews` results shown as orange wireframe FOV frustums with near-plane rectangles
 - **Composition layer inspector** — shows recently submitted composition layers, per-layer metadata, sub-image rects, swapchain/image indices, and depth-chain info
 - **OpenGL composition previews** — captures throttled previews of OpenGL/EGL color swapchain images on release, caches them per swapchain image, and displays them inside the composition layer inspector
+- **Vulkan composition previews** — captures throttled previews of Vulkan color swapchain images on release using the application's Vulkan device and queue, then displays the staged thumbnails in the composition layer inspector
 - **Preview inspect mode** — click a preview to toggle from fit view into actual-pixel inspection with wheel zoom, reset controls, and RGBA pixel hover readout
 - **Retained live layer view** — the inspector keeps recently missing layers around for a few frames and marks them stale, reducing panel flicker when apps omit a layer from one `xrEndFrame`
 - **Label anti-overlap** — overlapping space labels are automatically nudged apart
@@ -40,7 +41,7 @@ cmake --build build-ninja -j$(nproc)
 
 The default build type is **RelWithDebInfo** — this is important because ImGui's draw routines are unusably slow at `-O0`.
 
-Requires: CMake ≥ 3.20, C++17 compiler, OpenGL, X11 dev headers.  
+Requires: CMake ≥ 3.20, C++17 compiler, OpenGL, Vulkan, X11 dev headers.  
 SDL3, Dear ImGui, and OpenXR headers are fetched automatically via FetchContent.
 
 Output:
@@ -77,23 +78,56 @@ my_xr_app
 |---|---|
 | `XR_DEBUG_GUI_DISABLE=1` | Load layer but skip GUI window (interceptors still log to stderr) |
 | `XR_DEBUG_GUI_FPS=N` | GUI render rate, 1–240 (default: 30) |
-| `XR_DEBUG_GUI_GL_PREVIEW_INTERVAL=N` | Capture every `N`th eligible OpenGL swapchain release; `0` disables preview capture |
-| `XR_DEBUG_GUI_GL_PREVIEW_MAX_EDGE=N` | Maximum thumbnail edge length before downscaling (default: 320) |
-| `XR_DEBUG_GUI_GL_PREVIEW_LOG=1` | Log first successful preview capture and distinct preview skip/failure reasons per swapchain |
-| `XR_DEBUG_GUI_GL_PREVIEW_LOG=2` | Log every preview attempt and skip; useful only for short debugging runs |
+| `XR_DEBUG_GUI_PREVIEW_INTERVAL=N` | Capture every `N`th eligible previewable swapchain release; `0` disables preview capture |
+| `XR_DEBUG_GUI_PREVIEW_MAX_EDGE=N` | Maximum thumbnail edge length before downscaling (default: 320) |
+| `XR_DEBUG_GUI_PREVIEW_LOG=1` | Log first successful preview capture and distinct preview skip/failure reasons per swapchain |
+| `XR_DEBUG_GUI_PREVIEW_LOG=2` | Log every preview attempt and skip; useful only for short debugging runs |
+
+Legacy `XR_DEBUG_GUI_GL_PREVIEW_*` variable names are still accepted for compatibility.
 
 ## Composition Layer Preview Design
 
 - The layer deep-copies `xrEndFrame` layer submissions into tracked state so the GUI never depends on application-owned pointers after the call returns.
 - OpenGL preview capture runs on the application thread before `xrReleaseSwapchainImage`, where the image is still owned by the app and safe to read with the app's current context.
+- Vulkan preview capture also runs on the application thread before `xrReleaseSwapchainImage`, using the application's device and queue to draw a sampled thumbnail into an offscreen image and copy it into a staging buffer.
 - The preview path uses direct GL proc lookup (`eglGetProcAddress` / `glXGetProcAddressARB`) instead of SDL, because the app thread is not required to initialize SDL.
 - Captured previews are cached per `(swapchain, image index, array index)` instead of only keeping the newest preview for a swapchain. This avoids flicker when apps rotate through swapchain images.
 - The Composition Layers panel renders a short retained live set of recent layers instead of only the last frame. Layers missing for a few frames are marked stale before being dropped.
-- Current milestone scope is desktop OpenGL and `XR_MNDX_egl_enable` sessions only. Non-OpenGL sessions still show metadata without image content.
+- Current preview support includes desktop OpenGL, `XR_MNDX_egl_enable`, `XR_KHR_vulkan_enable`, and `XR_KHR_vulkan_enable2` sessions. Other graphics APIs still show metadata without image content.
 - Current preview limitations:
   - Cube and other multi-face swapchains are metadata-only.
+  - Non-color swapchains are metadata-only.
+  - Vulkan previews currently require sampled, single-sample images.
   - Array swapchains currently preview layer 0 only.
   - Preview capture is intended for debugging, not zero-copy production display.
+
+## Vulkan Validation Smoke Test
+
+The Vulkan preview path is smoke-tested with the system `hello_xr` binary and the
+Khronos validation layer enabled. Start Monado first, then run:
+
+```sh
+P_OVERRIDE_ACTIVE_CONFIG=remote XRT_COMPOSITOR_FORCE_XCB=1 XRT_NO_STDIN=1 \
+    /home/haagch-demo/projects/vibecoding-tests/monado/build/src/xrt/targets/service/monado-service \
+    >/tmp/monado.log 2>&1 &
+MONADO_PID=$!
+until grep -q "Listening on port '4242'" /tmp/monado.log 2>/dev/null; do sleep 0.2; done
+
+sleep infinity | env \
+    VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+    XR_DEBUG_GUI_PREVIEW_LOG=1 \
+    XR_DEBUG_GUI_PREVIEW_INTERVAL=1 \
+    stdbuf -oL -eL \
+    build-ninja/xr-with-debug-gui.sh --no-gui /usr/bin/hello_xr -G Vulkan2 \
+    2>&1 | tee /tmp/hello_xr_vulkan_validation.log
+
+rg -n "Captured Vulkan preview|VUID|Validation Error|ERROR:" /tmp/hello_xr_vulkan_validation.log
+kill $MONADO_PID
+```
+
+Successful runs reach `XR_SESSION_STATE_FOCUSED`, log `Captured Vulkan preview`
+for both eye swapchains, and do not emit any `VUID`, `Validation Error`, or
+`ERROR:` lines. The same recipe also works with `hello_xr -G Vulkan`.
 
 ## World-Space Layer Rendering Notes
 
@@ -126,4 +160,5 @@ gui/gui_perf.h/.cpp     Performance observatory: stacked bars, real-time timelin
 - Only `xrNegotiateLoaderApiLayerInterface` is exported from the .so
 - Newly added panels should define a fallback dock target with `ImGui::SetNextWindowDockID(..., ImGuiCond_Appearing)` because persisted `imgui.ini` layouts bypass the first-run dock builder.
 - The Composition Layers panel uses retained previews and retained recent-layer state to reduce flicker from rotating swapchain indices and temporarily omitted layers.
+- Use the `build-ninja/xr-with-debug-gui.sh` wrapper for smoke tests; it points `XR_API_LAYER_PATH` at the manifest-only Ninja build directory and avoids loader warnings from unrelated files.
 - Layout resets: delete `~/.config/openxr_debug_gui/imgui.ini`

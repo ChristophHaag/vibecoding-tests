@@ -7,7 +7,7 @@ debug_layer/
 ├── CMakeLists.txt                 Build system (FetchContent for SDL3, ImGui, OpenXR headers)
 ├── XrApiLayer_debug_gui.json      Layer manifest (loader reads this)
 ├── XrApiLayer_debug_gui.map       Linker version script (exports only negotiate symbol)
-├── xr-with-debug-gui.sh.in        CMake template → build/xr-with-debug-gui.sh
+├── xr-with-debug-gui.sh.in        CMake template → build-ninja/xr-with-debug-gui.sh
 ├── README.md
 ├── DECISIONS.md                   Architecture rationale
 ├── PLAN.md                        Original feature plan
@@ -109,19 +109,20 @@ main dockspace instead of floating.
 
 - **SDL3 is statically linked** with `-Wl,-Bsymbolic -Wl,--exclude-libs,ALL` so no SDL symbols leak. This prevents conflicts with apps using SDL2. Never switch to shared SDL3.
 - **`XR_NO_PROTOTYPES`** is defined — use `PFN_xr*` function pointer types, not direct prototypes.
-- The version script `XrApiLayer_debug_gui.map` ensures only `xrNegotiateLoaderApiLayerInterface` is exported. Verify with `nm -D build/libXrApiLayer_debug_gui.so | grep -w T`.
+- When Vulkan bindings are enabled, include `vulkan/vulkan.h` before `openxr/openxr_platform.h` and protect that order from `clang-format`; otherwise the OpenXR Vulkan binding structs will not compile.
+- The version script `XrApiLayer_debug_gui.map` ensures only `xrNegotiateLoaderApiLayerInterface` is exported. Verify with `nm -D build-ninja/libXrApiLayer_debug_gui.so | grep -w T`.
 - ImGui docking branch is required (tag pattern: `v*-docking`). The `DockBuilder` API is from `imgui_internal.h`.
 - Layout persistence: `~/.config/openxr_debug_gui/imgui.ini`. Delete to reset.
 - OpenGL preview capture happens on the application thread before `xrReleaseSwapchainImage`, not on the GUI thread. This is deliberate to avoid cross-context ownership issues.
 - Do not use `SDL_GL_GetProcAddress` on application threads for swapchain preview capture. Use direct GL/EGL/GLX proc lookup because SDL may not be initialized there.
 - `XR_TYPE_GRAPHICS_BINDING_EGL_MNDX` should be treated as desktop OpenGL for preview eligibility and UI labeling.
-- Current preview support is intentionally limited to OpenGL color swapchains; non-color swapchains, cube faces, and non-OpenGL sessions remain metadata-only.
+- Preview capture currently supports desktop OpenGL/EGL color swapchains and Vulkan color swapchains. Non-color swapchains remain metadata-only; Vulkan previews currently require sampled, single-sample images and preview array layer 0 only.
 
 ## Composition Layers Panel
 
 - The Composition Layers panel renders a retained live set built from recent `xrEndFrame` submissions instead of only `composition_frames.back()`.
 - Keep the non-inspect preview layout height stable even when a preview is missing, otherwise the details below will visibly jump during runtime.
-- Preview debug logging is controlled by `XR_DEBUG_GUI_GL_PREVIEW_LOG`:
+- Preview debug logging is controlled by `XR_DEBUG_GUI_PREVIEW_LOG` (legacy `XR_DEBUG_GUI_GL_PREVIEW_LOG` is still accepted):
     - `0`: silent
     - `1`: first success and distinct failure/skip reasons per swapchain
     - `2`: every attempt
@@ -142,13 +143,39 @@ main dockspace instead of floating.
 Use the wrapper script against any OpenXR app:
 
 ```sh
-build/xr-with-debug-gui.sh <openxr-app> [args...]
+build-ninja/xr-with-debug-gui.sh <openxr-app> [args...]
 ```
 
 Or with interceptors only (no window):
 
 ```sh
-build/xr-with-debug-gui.sh --no-gui <openxr-app> [args...]
+build-ninja/xr-with-debug-gui.sh --no-gui <openxr-app> [args...]
+```
+
+Prefer the `build-ninja` wrapper for smoke tests. It points `XR_API_LAYER_PATH` at
+the manifest-only build directory and avoids OpenXR loader warnings from unrelated
+files in older tracked build trees.
+
+For Vulkan preview validation, start Monado first and then run `hello_xr` through
+the wrapper with the Khronos validation layer enabled:
+
+```sh
+P_OVERRIDE_ACTIVE_CONFIG=remote XRT_COMPOSITOR_FORCE_XCB=1 XRT_NO_STDIN=1 \
+    /home/haagch-demo/projects/vibecoding-tests/monado/build/src/xrt/targets/service/monado-service \
+    >/tmp/monado.log 2>&1 &
+MONADO_PID=$!
+until grep -q "Listening on port '4242'" /tmp/monado.log 2>/dev/null; do sleep 0.2; done
+
+sleep infinity | env \
+    VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+    XR_DEBUG_GUI_PREVIEW_LOG=1 \
+    XR_DEBUG_GUI_PREVIEW_INTERVAL=1 \
+    stdbuf -oL -eL \
+    build-ninja/xr-with-debug-gui.sh --no-gui /usr/bin/hello_xr -G Vulkan2 \
+    2>&1 | tee /tmp/hello_xr_vulkan_validation.log
+
+rg -n "Captured Vulkan preview|VUID|Validation Error|ERROR:" /tmp/hello_xr_vulkan_validation.log
+kill $MONADO_PID
 ```
 
 Layer log messages go to stderr with prefix `[XR_APILAYER_DEBUG_gui]`.

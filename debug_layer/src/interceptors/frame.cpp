@@ -4,20 +4,31 @@
 
 #include "../dispatch.h"
 #include "../instance_data.h"
+#include "vulkan_preview_spv.h"
 
 #include <EGL/egl.h>
 #include <GL/glx.h>
 #include <SDL3/SDL_opengl.h>
 
+// clang-format off
 #define XR_USE_GRAPHICS_API_OPENGL
+#define XR_USE_GRAPHICS_API_VULKAN
+#include <vulkan/vulkan.h>
 #include <openxr/openxr_platform.h>
+// clang-format on
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace debug_layer {
@@ -46,17 +57,66 @@ static int parse_env_int(const char *name, int fallback, int min_value,
   return std::clamp(parsed, min_value, max_value);
 }
 
+static int parse_env_int_with_legacy(const char *primary_name,
+                                     const char *legacy_name, int fallback,
+                                     int min_value, int max_value) {
+  const char *env = std::getenv(primary_name);
+  if ((env == nullptr || env[0] == '\0') && legacy_name != nullptr)
+    env = std::getenv(legacy_name);
+
+  if (env == nullptr || env[0] == '\0')
+    return fallback;
+
+  int parsed = std::atoi(env);
+  return std::clamp(parsed, min_value, max_value);
+}
+
 static PreviewCaptureConfig get_preview_capture_config() {
   static PreviewCaptureConfig config = [] {
     PreviewCaptureConfig c;
-    c.capture_interval =
-        parse_env_int("XR_DEBUG_GUI_GL_PREVIEW_INTERVAL", 2, 0, 120);
-    c.max_edge = parse_env_int("XR_DEBUG_GUI_GL_PREVIEW_MAX_EDGE", 320, 32,
-                               2048);
+    c.capture_interval = parse_env_int_with_legacy(
+        "XR_DEBUG_GUI_PREVIEW_INTERVAL", "XR_DEBUG_GUI_GL_PREVIEW_INTERVAL", 2,
+        0, 120);
+    c.max_edge = parse_env_int_with_legacy("XR_DEBUG_GUI_PREVIEW_MAX_EDGE",
+                                           "XR_DEBUG_GUI_GL_PREVIEW_MAX_EDGE",
+                                           320, 32, 2048);
     return c;
   }();
   return config;
 }
+
+template <typename Handle> static uint64_t pack_handle(Handle handle) {
+  if constexpr (std::is_pointer_v<Handle>)
+    return (uint64_t)reinterpret_cast<uintptr_t>(handle);
+  else
+    return (uint64_t)handle;
+}
+
+template <typename Handle> static Handle unpack_handle(uint64_t value) {
+  if constexpr (std::is_pointer_v<Handle>)
+    return reinterpret_cast<Handle>((uintptr_t)value);
+  else
+    return (Handle)value;
+}
+
+struct PreviewCaptureRequest {
+  XrSession session = XR_NULL_HANDLE;
+  XrSwapchain swapchain = XR_NULL_HANDLE;
+  TrackedSession::GraphicsBindingKind graphics_binding =
+      TrackedSession::GraphicsBindingKind::UNKNOWN;
+  XrSwapchainUsageFlags usage_flags = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t array_size = 0;
+  uint32_t face_count = 0;
+  uint32_t sample_count = 0;
+  int64_t format = 0;
+  uint64_t release_serial = 0;
+  bool has_latest_acquired_index = false;
+  uint32_t image_index = 0;
+  XrStructureType image_type = XR_TYPE_UNKNOWN;
+  uint64_t image_handle_value = 0;
+};
 
 static uint64_t make_preview_key(uint32_t image_index,
                                  uint32_t image_array_index) {
@@ -64,9 +124,52 @@ static uint64_t make_preview_key(uint32_t image_index,
 }
 
 static int get_preview_log_level() {
-  static int level = parse_env_int("XR_DEBUG_GUI_GL_PREVIEW_LOG", 0, 0, 2);
+  static int level = parse_env_int_with_legacy(
+      "XR_DEBUG_GUI_PREVIEW_LOG", "XR_DEBUG_GUI_GL_PREVIEW_LOG", 0, 0, 2);
   return level;
 }
+
+struct VulkanPreviewSessionBinding {
+  VkInstance instance = VK_NULL_HANDLE;
+  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+  VkDevice device = VK_NULL_HANDLE;
+  uint32_t queue_family_index = 0;
+  uint32_t queue_index = 0;
+};
+
+struct VulkanPreviewSessionState {
+  std::mutex mutex;
+  VulkanPreviewSessionBinding binding;
+  VkQueue queue = VK_NULL_HANDLE;
+  VkCommandPool command_pool = VK_NULL_HANDLE;
+  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  VkSampler sampler = VK_NULL_HANDLE;
+  VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+  VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
+  VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+  VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+  VkShaderModule vertex_shader = VK_NULL_HANDLE;
+  VkShaderModule fragment_shader = VK_NULL_HANDLE;
+  VkRenderPass render_pass = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkImage destination_image = VK_NULL_HANDLE;
+  VkDeviceMemory destination_memory = VK_NULL_HANDLE;
+  VkImageView destination_image_view = VK_NULL_HANDLE;
+  VkFramebuffer framebuffer = VK_NULL_HANDLE;
+  VkBuffer staging_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+  void *mapped_staging = nullptr;
+  bool staging_memory_coherent = false;
+  VkDeviceSize staging_buffer_size = 0;
+  uint32_t destination_width = 0;
+  uint32_t destination_height = 0;
+  bool static_resources_ready = false;
+};
+
+static std::mutex g_vulkan_preview_sessions_mutex;
+static std::unordered_map<XrSession, std::shared_ptr<VulkanPreviewSessionState>>
+    g_vulkan_preview_sessions;
 
 static struct {
   bool loaded = false;
@@ -107,7 +210,7 @@ static bool load_preview_gl_functions() {
   }
 
 #define LOAD(name)                                                             \
-  preview_gl.name =                                                           \
+  preview_gl.name =                                                            \
       (decltype(preview_gl.name))get_preview_gl_proc_address("gl" #name)
   LOAD(GenFramebuffers);
   LOAD(BindFramebuffer);
@@ -128,6 +231,608 @@ static bool load_preview_gl_functions() {
          preview_gl.BlitFramebuffer != nullptr;
 }
 
+static std::shared_ptr<VulkanPreviewSessionState>
+get_vulkan_preview_session_state(XrSession session) {
+  std::lock_guard lock(g_vulkan_preview_sessions_mutex);
+  auto it = g_vulkan_preview_sessions.find(session);
+  return it != g_vulkan_preview_sessions.end() ? it->second : nullptr;
+}
+
+static void
+destroy_vulkan_preview_target_resources(VulkanPreviewSessionState &state) {
+  VkDevice device = state.binding.device;
+  if (device == VK_NULL_HANDLE)
+    return;
+
+  if (state.mapped_staging != nullptr &&
+      state.staging_memory != VK_NULL_HANDLE) {
+    vkUnmapMemory(device, state.staging_memory);
+    state.mapped_staging = nullptr;
+  }
+  if (state.framebuffer != VK_NULL_HANDLE)
+    vkDestroyFramebuffer(device, state.framebuffer, nullptr);
+  if (state.destination_image_view != VK_NULL_HANDLE)
+    vkDestroyImageView(device, state.destination_image_view, nullptr);
+  if (state.destination_image != VK_NULL_HANDLE)
+    vkDestroyImage(device, state.destination_image, nullptr);
+  if (state.destination_memory != VK_NULL_HANDLE)
+    vkFreeMemory(device, state.destination_memory, nullptr);
+  if (state.staging_buffer != VK_NULL_HANDLE)
+    vkDestroyBuffer(device, state.staging_buffer, nullptr);
+  if (state.staging_memory != VK_NULL_HANDLE)
+    vkFreeMemory(device, state.staging_memory, nullptr);
+
+  state.framebuffer = VK_NULL_HANDLE;
+  state.destination_image_view = VK_NULL_HANDLE;
+  state.destination_image = VK_NULL_HANDLE;
+  state.destination_memory = VK_NULL_HANDLE;
+  state.staging_buffer = VK_NULL_HANDLE;
+  state.staging_memory = VK_NULL_HANDLE;
+  state.staging_buffer_size = 0;
+  state.destination_width = 0;
+  state.destination_height = 0;
+  state.staging_memory_coherent = false;
+}
+
+static void
+destroy_vulkan_preview_static_resources(VulkanPreviewSessionState &state) {
+  VkDevice device = state.binding.device;
+  if (device == VK_NULL_HANDLE)
+    return;
+
+  destroy_vulkan_preview_target_resources(state);
+
+  if (state.pipeline != VK_NULL_HANDLE)
+    vkDestroyPipeline(device, state.pipeline, nullptr);
+  if (state.render_pass != VK_NULL_HANDLE)
+    vkDestroyRenderPass(device, state.render_pass, nullptr);
+  if (state.fragment_shader != VK_NULL_HANDLE)
+    vkDestroyShaderModule(device, state.fragment_shader, nullptr);
+  if (state.vertex_shader != VK_NULL_HANDLE)
+    vkDestroyShaderModule(device, state.vertex_shader, nullptr);
+  if (state.pipeline_layout != VK_NULL_HANDLE)
+    vkDestroyPipelineLayout(device, state.pipeline_layout, nullptr);
+  if (state.descriptor_pool != VK_NULL_HANDLE)
+    vkDestroyDescriptorPool(device, state.descriptor_pool, nullptr);
+  if (state.descriptor_set_layout != VK_NULL_HANDLE)
+    vkDestroyDescriptorSetLayout(device, state.descriptor_set_layout, nullptr);
+  if (state.sampler != VK_NULL_HANDLE)
+    vkDestroySampler(device, state.sampler, nullptr);
+  if (state.command_pool != VK_NULL_HANDLE)
+    vkDestroyCommandPool(device, state.command_pool, nullptr);
+  if (state.fence != VK_NULL_HANDLE)
+    vkDestroyFence(device, state.fence, nullptr);
+
+  state.pipeline = VK_NULL_HANDLE;
+  state.render_pass = VK_NULL_HANDLE;
+  state.fragment_shader = VK_NULL_HANDLE;
+  state.vertex_shader = VK_NULL_HANDLE;
+  state.pipeline_layout = VK_NULL_HANDLE;
+  state.descriptor_pool = VK_NULL_HANDLE;
+  state.descriptor_set_layout = VK_NULL_HANDLE;
+  state.sampler = VK_NULL_HANDLE;
+  state.command_pool = VK_NULL_HANDLE;
+  state.command_buffer = VK_NULL_HANDLE;
+  state.fence = VK_NULL_HANDLE;
+  state.descriptor_set = VK_NULL_HANDLE;
+  state.queue = VK_NULL_HANDLE;
+  state.static_resources_ready = false;
+}
+
+static bool find_vulkan_memory_type(VkPhysicalDevice physical_device,
+                                    uint32_t type_bits,
+                                    VkMemoryPropertyFlags required_flags,
+                                    VkMemoryPropertyFlags preferred_flags,
+                                    uint32_t &type_index_out,
+                                    bool &preferred_flags_available) {
+  if (physical_device == VK_NULL_HANDLE)
+    return false;
+
+  VkPhysicalDeviceMemoryProperties memory_properties;
+  vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
+
+  int fallback_index = -1;
+  for (uint32_t index = 0; index < memory_properties.memoryTypeCount; ++index) {
+    if ((type_bits & (1u << index)) == 0)
+      continue;
+
+    VkMemoryPropertyFlags property_flags =
+        memory_properties.memoryTypes[index].propertyFlags;
+    if ((property_flags & required_flags) != required_flags)
+      continue;
+
+    if ((property_flags & preferred_flags) == preferred_flags) {
+      type_index_out = index;
+      preferred_flags_available = true;
+      return true;
+    }
+
+    if (fallback_index < 0)
+      fallback_index = (int)index;
+  }
+
+  if (fallback_index < 0)
+    return false;
+
+  type_index_out = (uint32_t)fallback_index;
+  preferred_flags_available = preferred_flags == 0;
+  return true;
+}
+
+static bool create_vulkan_shader_module(VkDevice device,
+                                        const unsigned char *shader_bytes,
+                                        size_t shader_size,
+                                        VkShaderModule &shader_module) {
+  VkShaderModuleCreateInfo create_info{
+      VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  create_info.codeSize = shader_size;
+  create_info.pCode = reinterpret_cast<const uint32_t *>(shader_bytes);
+  return vkCreateShaderModule(device, &create_info, nullptr, &shader_module) ==
+         VK_SUCCESS;
+}
+
+static bool
+ensure_vulkan_preview_static_resources(VulkanPreviewSessionState &state,
+                                       std::string &status) {
+  if (state.static_resources_ready)
+    return true;
+
+  if (state.binding.device == VK_NULL_HANDLE ||
+      state.binding.physical_device == VK_NULL_HANDLE) {
+    status = "Vulkan preview session binding is incomplete";
+    return false;
+  }
+
+  VkDevice device = state.binding.device;
+  vkGetDeviceQueue(device, state.binding.queue_family_index,
+                   state.binding.queue_index, &state.queue);
+  if (state.queue == VK_NULL_HANDLE) {
+    status = "Failed to retrieve the Vulkan queue from xrCreateSession";
+    return false;
+  }
+
+  VkCommandPoolCreateInfo command_pool_info{
+      VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  command_pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  command_pool_info.queueFamilyIndex = state.binding.queue_family_index;
+  if (vkCreateCommandPool(device, &command_pool_info, nullptr,
+                          &state.command_pool) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview command pool";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  VkCommandBufferAllocateInfo command_buffer_info{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  command_buffer_info.commandPool = state.command_pool;
+  command_buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  command_buffer_info.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(device, &command_buffer_info,
+                               &state.command_buffer) != VK_SUCCESS) {
+    status = "Failed to allocate the Vulkan preview command buffer";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+  if (vkCreateFence(device, &fence_info, nullptr, &state.fence) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview fence";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  sampler_info.magFilter = VK_FILTER_NEAREST;
+  sampler_info.minFilter = VK_FILTER_NEAREST;
+  sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.minLod = 0.0f;
+  sampler_info.maxLod = 0.0f;
+  if (vkCreateSampler(device, &sampler_info, nullptr, &state.sampler) !=
+      VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview sampler";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  VkDescriptorSetLayoutBinding descriptor_binding{};
+  descriptor_binding.binding = 0;
+  descriptor_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  descriptor_binding.descriptorCount = 1;
+  descriptor_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  VkDescriptorSetLayoutCreateInfo descriptor_set_layout_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  descriptor_set_layout_info.bindingCount = 1;
+  descriptor_set_layout_info.pBindings = &descriptor_binding;
+  if (vkCreateDescriptorSetLayout(device, &descriptor_set_layout_info, nullptr,
+                                  &state.descriptor_set_layout) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview descriptor set layout";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  VkDescriptorPoolSize descriptor_pool_size{};
+  descriptor_pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  descriptor_pool_size.descriptorCount = 1;
+
+  VkDescriptorPoolCreateInfo descriptor_pool_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  descriptor_pool_info.maxSets = 1;
+  descriptor_pool_info.poolSizeCount = 1;
+  descriptor_pool_info.pPoolSizes = &descriptor_pool_size;
+  if (vkCreateDescriptorPool(device, &descriptor_pool_info, nullptr,
+                             &state.descriptor_pool) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview descriptor pool";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  VkDescriptorSetAllocateInfo descriptor_set_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  descriptor_set_info.descriptorPool = state.descriptor_pool;
+  descriptor_set_info.descriptorSetCount = 1;
+  descriptor_set_info.pSetLayouts = &state.descriptor_set_layout;
+  if (vkAllocateDescriptorSets(device, &descriptor_set_info,
+                               &state.descriptor_set) != VK_SUCCESS) {
+    status = "Failed to allocate the Vulkan preview descriptor set";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  if (!create_vulkan_shader_module(device, kVulkanPreviewVertexShaderSpv,
+                                   sizeof(kVulkanPreviewVertexShaderSpv),
+                                   state.vertex_shader)) {
+    status = "Failed to create the Vulkan preview vertex shader module";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+  if (!create_vulkan_shader_module(device, kVulkanPreviewFragmentShaderSpv,
+                                   sizeof(kVulkanPreviewFragmentShaderSpv),
+                                   state.fragment_shader)) {
+    status = "Failed to create the Vulkan preview fragment shader module";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  VkAttachmentDescription color_attachment{};
+  color_attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+  color_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+  color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  color_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  color_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  color_attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  color_attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+  VkAttachmentReference color_attachment_ref{};
+  color_attachment_ref.attachment = 0;
+  color_attachment_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+  VkSubpassDescription subpass{};
+  subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  subpass.colorAttachmentCount = 1;
+  subpass.pColorAttachments = &color_attachment_ref;
+
+  VkRenderPassCreateInfo render_pass_info{
+      VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  render_pass_info.attachmentCount = 1;
+  render_pass_info.pAttachments = &color_attachment;
+  render_pass_info.subpassCount = 1;
+  render_pass_info.pSubpasses = &subpass;
+  if (vkCreateRenderPass(device, &render_pass_info, nullptr,
+                         &state.render_pass) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview render pass";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  VkPipelineLayoutCreateInfo pipeline_layout_info{
+      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &state.descriptor_set_layout;
+  if (vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                             &state.pipeline_layout) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview pipeline layout";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  VkPipelineShaderStageCreateInfo shader_stages[2]{};
+  shader_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  shader_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  shader_stages[0].module = state.vertex_shader;
+  shader_stages[0].pName = "main";
+  shader_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  shader_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  shader_stages[1].module = state.fragment_shader;
+  shader_stages[1].pName = "main";
+
+  VkPipelineVertexInputStateCreateInfo vertex_input_info{
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+
+  VkPipelineInputAssemblyStateCreateInfo input_assembly_info{
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  input_assembly_info.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+  VkPipelineViewportStateCreateInfo viewport_state_info{
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  viewport_state_info.viewportCount = 1;
+  viewport_state_info.scissorCount = 1;
+
+  VkPipelineRasterizationStateCreateInfo rasterization_info{
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rasterization_info.polygonMode = VK_POLYGON_MODE_FILL;
+  rasterization_info.cullMode = VK_CULL_MODE_NONE;
+  rasterization_info.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rasterization_info.lineWidth = 1.0f;
+
+  VkPipelineMultisampleStateCreateInfo multisample_info{
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  multisample_info.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkPipelineColorBlendAttachmentState color_blend_attachment{};
+  color_blend_attachment.colorWriteMask =
+      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+  VkPipelineColorBlendStateCreateInfo color_blend_info{
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  color_blend_info.attachmentCount = 1;
+  color_blend_info.pAttachments = &color_blend_attachment;
+
+  VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                     VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dynamic_state_info{
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dynamic_state_info.dynamicStateCount = 2;
+  dynamic_state_info.pDynamicStates = dynamic_states;
+
+  VkGraphicsPipelineCreateInfo pipeline_info{
+      VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  pipeline_info.stageCount = 2;
+  pipeline_info.pStages = shader_stages;
+  pipeline_info.pVertexInputState = &vertex_input_info;
+  pipeline_info.pInputAssemblyState = &input_assembly_info;
+  pipeline_info.pViewportState = &viewport_state_info;
+  pipeline_info.pRasterizationState = &rasterization_info;
+  pipeline_info.pMultisampleState = &multisample_info;
+  pipeline_info.pColorBlendState = &color_blend_info;
+  pipeline_info.pDynamicState = &dynamic_state_info;
+  pipeline_info.layout = state.pipeline_layout;
+  pipeline_info.renderPass = state.render_pass;
+  pipeline_info.subpass = 0;
+  if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                nullptr, &state.pipeline) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview pipeline";
+    destroy_vulkan_preview_static_resources(state);
+    return false;
+  }
+
+  state.static_resources_ready = true;
+  return true;
+}
+
+static bool ensure_vulkan_preview_target_resources(
+    VulkanPreviewSessionState &state, uint32_t preview_width,
+    uint32_t preview_height, bool &recreated, std::string &status) {
+  recreated = false;
+  if (state.destination_image != VK_NULL_HANDLE &&
+      state.destination_width == preview_width &&
+      state.destination_height == preview_height &&
+      state.staging_buffer != VK_NULL_HANDLE && state.mapped_staging != nullptr)
+    return true;
+
+  destroy_vulkan_preview_target_resources(state);
+  recreated = true;
+
+  VkDevice device = state.binding.device;
+  VkDeviceSize staging_size =
+      (VkDeviceSize)preview_width * (VkDeviceSize)preview_height * 4;
+
+  VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  image_info.imageType = VK_IMAGE_TYPE_2D;
+  image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  image_info.extent = {preview_width, preview_height, 1};
+  image_info.mipLevels = 1;
+  image_info.arrayLayers = 1;
+  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_info.usage =
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vkCreateImage(device, &image_info, nullptr, &state.destination_image) !=
+      VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview destination image";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+
+  VkMemoryRequirements image_memory_requirements;
+  vkGetImageMemoryRequirements(device, state.destination_image,
+                               &image_memory_requirements);
+  uint32_t image_memory_type_index = 0;
+  bool image_memory_preferred = false;
+  if (!find_vulkan_memory_type(state.binding.physical_device,
+                               image_memory_requirements.memoryTypeBits,
+                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                               image_memory_type_index,
+                               image_memory_preferred)) {
+    status = "Failed to find device-local Vulkan memory for the preview image";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+
+  VkMemoryAllocateInfo image_memory_info{
+      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  image_memory_info.allocationSize = image_memory_requirements.size;
+  image_memory_info.memoryTypeIndex = image_memory_type_index;
+  if (vkAllocateMemory(device, &image_memory_info, nullptr,
+                       &state.destination_memory) != VK_SUCCESS) {
+    status = "Failed to allocate Vulkan memory for the preview image";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+  if (vkBindImageMemory(device, state.destination_image,
+                        state.destination_memory, 0) != VK_SUCCESS) {
+    status = "Failed to bind Vulkan memory for the preview image";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+
+  VkImageViewCreateInfo image_view_info{
+      VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  image_view_info.image = state.destination_image;
+  image_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  image_view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  image_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  image_view_info.subresourceRange.baseMipLevel = 0;
+  image_view_info.subresourceRange.levelCount = 1;
+  image_view_info.subresourceRange.baseArrayLayer = 0;
+  image_view_info.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(device, &image_view_info, nullptr,
+                        &state.destination_image_view) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview destination image view";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+
+  VkFramebufferCreateInfo framebuffer_info{
+      VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  framebuffer_info.renderPass = state.render_pass;
+  framebuffer_info.attachmentCount = 1;
+  framebuffer_info.pAttachments = &state.destination_image_view;
+  framebuffer_info.width = preview_width;
+  framebuffer_info.height = preview_height;
+  framebuffer_info.layers = 1;
+  if (vkCreateFramebuffer(device, &framebuffer_info, nullptr,
+                          &state.framebuffer) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview framebuffer";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+
+  VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  buffer_info.size = staging_size;
+  buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if (vkCreateBuffer(device, &buffer_info, nullptr, &state.staging_buffer) !=
+      VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview staging buffer";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+
+  VkMemoryRequirements buffer_memory_requirements;
+  vkGetBufferMemoryRequirements(device, state.staging_buffer,
+                                &buffer_memory_requirements);
+  uint32_t buffer_memory_type_index = 0;
+  bool host_coherent = false;
+  if (!find_vulkan_memory_type(state.binding.physical_device,
+                               buffer_memory_requirements.memoryTypeBits,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                               buffer_memory_type_index, host_coherent)) {
+    status = "Failed to find host-visible Vulkan memory for the staging buffer";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+
+  VkMemoryAllocateInfo buffer_memory_info{
+      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  buffer_memory_info.allocationSize = buffer_memory_requirements.size;
+  buffer_memory_info.memoryTypeIndex = buffer_memory_type_index;
+  if (vkAllocateMemory(device, &buffer_memory_info, nullptr,
+                       &state.staging_memory) != VK_SUCCESS) {
+    status = "Failed to allocate Vulkan memory for the staging buffer";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+  if (vkBindBufferMemory(device, state.staging_buffer, state.staging_memory,
+                         0) != VK_SUCCESS) {
+    status = "Failed to bind Vulkan memory for the staging buffer";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+  if (vkMapMemory(device, state.staging_memory, 0, staging_size, 0,
+                  &state.mapped_staging) != VK_SUCCESS) {
+    status = "Failed to map the Vulkan preview staging memory";
+    destroy_vulkan_preview_target_resources(state);
+    return false;
+  }
+
+  state.staging_memory_coherent = host_coherent;
+  state.staging_buffer_size = staging_size;
+  state.destination_width = preview_width;
+  state.destination_height = preview_height;
+  return true;
+}
+
+static bool infer_vulkan_source_layout(const PreviewCaptureRequest &request,
+                                       VkImageLayout &layout_out) {
+  if ((request.usage_flags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) != 0) {
+    layout_out = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    return true;
+  }
+  if ((request.usage_flags & XR_SWAPCHAIN_USAGE_SAMPLED_BIT) != 0) {
+    layout_out = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return true;
+  }
+  return false;
+}
+
+void register_preview_capture_session_binding(
+    XrSession session, const XrSessionCreateInfo *create_info) {
+  if (session == XR_NULL_HANDLE || create_info == nullptr)
+    return;
+
+  const XrBaseInStructure *current =
+      reinterpret_cast<const XrBaseInStructure *>(create_info->next);
+  while (current != nullptr) {
+    if (current->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR ||
+        current->type == XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR) {
+      auto *binding =
+          reinterpret_cast<const XrGraphicsBindingVulkanKHR *>(current);
+      std::shared_ptr<VulkanPreviewSessionState> state;
+      {
+        std::lock_guard lock(g_vulkan_preview_sessions_mutex);
+        auto &slot = g_vulkan_preview_sessions[session];
+        if (!slot)
+          slot = std::make_shared<VulkanPreviewSessionState>();
+        state = slot;
+      }
+
+      std::lock_guard capture_lock(state->mutex);
+      destroy_vulkan_preview_static_resources(*state);
+      state->binding.instance = binding->instance;
+      state->binding.physical_device = binding->physicalDevice;
+      state->binding.device = binding->device;
+      state->binding.queue_family_index = binding->queueFamilyIndex;
+      state->binding.queue_index = binding->queueIndex;
+      return;
+    }
+    current = current->next;
+  }
+}
+
+void destroy_preview_capture_session_resources(XrSession session) {
+  std::shared_ptr<VulkanPreviewSessionState> state;
+  {
+    std::lock_guard lock(g_vulkan_preview_sessions_mutex);
+    auto it = g_vulkan_preview_sessions.find(session);
+    if (it == g_vulkan_preview_sessions.end())
+      return;
+    state = it->second;
+    g_vulkan_preview_sessions.erase(it);
+  }
+
+  std::lock_guard capture_lock(state->mutex);
+  destroy_vulkan_preview_static_resources(*state);
+}
+
 enum class PreviewAttachmentKind {
   Unsupported,
   Texture2D,
@@ -135,43 +840,126 @@ enum class PreviewAttachmentKind {
 };
 
 static PreviewAttachmentKind
-get_preview_attachment_kind(const TrackedSwapchain &swapchain) {
-  if (swapchain.face_count != 1)
+get_preview_attachment_kind(const PreviewCaptureRequest &request) {
+  if (request.face_count != 1)
     return PreviewAttachmentKind::Unsupported;
-  if (swapchain.array_size > 1)
+  if (request.array_size > 1)
     return PreviewAttachmentKind::Texture2DArrayLayer0;
   return PreviewAttachmentKind::Texture2D;
 }
 
-static const char *preview_capture_skip_reason(const TrackedSession *session,
-                                               const TrackedSwapchain &swapchain) {
-  if (session == nullptr ||
-      session->graphics_binding != TrackedSession::GraphicsBindingKind::OPENGL)
+static bool build_preview_capture_request(const InstanceData *data,
+                                          XrSwapchain swapchain,
+                                          PreviewCaptureRequest &request) {
+  auto swapchain_it = data->swapchains.find(swapchain);
+  if (swapchain_it == data->swapchains.end())
+    return false;
+
+  const TrackedSwapchain &tracked_swapchain = swapchain_it->second;
+  request.session = tracked_swapchain.session;
+  request.swapchain = swapchain;
+  request.usage_flags = tracked_swapchain.usage_flags;
+  request.width = tracked_swapchain.width;
+  request.height = tracked_swapchain.height;
+  request.array_size = tracked_swapchain.array_size;
+  request.face_count = tracked_swapchain.face_count;
+  request.sample_count = tracked_swapchain.sample_count;
+  request.format = tracked_swapchain.format;
+  request.release_serial = tracked_swapchain.release_serial;
+  request.has_latest_acquired_index =
+      tracked_swapchain.has_latest_acquired_index;
+  if (tracked_swapchain.has_latest_acquired_index &&
+      tracked_swapchain.latest_acquired_index <
+          tracked_swapchain.images.size()) {
+    request.image_index = tracked_swapchain.latest_acquired_index;
+    request.image_type =
+        tracked_swapchain.images[tracked_swapchain.latest_acquired_index].type;
+    request.image_handle_value =
+        tracked_swapchain.images[tracked_swapchain.latest_acquired_index]
+            .handle_value;
+  }
+
+  auto session_it = data->sessions.find(tracked_swapchain.session);
+  if (session_it != data->sessions.end())
+    request.graphics_binding = session_it->second.graphics_binding;
+
+  return true;
+}
+
+static const char *
+preview_capture_skip_reason_opengl(const PreviewCaptureRequest &request) {
+  if (request.graphics_binding != TrackedSession::GraphicsBindingKind::OPENGL)
     return "Session graphics binding is not classified as desktop OpenGL";
 
-  if ((swapchain.usage_flags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) == 0)
+  if ((request.usage_flags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) == 0)
     return "Swapchain is not a color attachment";
 
-  if (!swapchain.has_latest_acquired_index ||
-      swapchain.latest_acquired_index >= swapchain.images.size())
+  if (!request.has_latest_acquired_index)
     return "No acquired swapchain image is available yet";
 
-  if (swapchain.images[swapchain.latest_acquired_index].type !=
-      XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR)
+  if (request.image_type != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR)
     return "Swapchain image type is not XrSwapchainImageOpenGLKHR";
 
-  if (get_preview_attachment_kind(swapchain) ==
+  if (get_preview_attachment_kind(request) ==
       PreviewAttachmentKind::Unsupported)
     return "Cube and multi-face OpenGL swapchains are not supported yet";
 
   PreviewCaptureConfig config = get_preview_capture_config();
   if (config.capture_interval <= 0)
-    return "Preview capture disabled by XR_DEBUG_GUI_GL_PREVIEW_INTERVAL=0";
+    return "Preview capture disabled by XR_DEBUG_GUI_PREVIEW_INTERVAL=0";
 
-  uint64_t pending_serial = swapchain.release_serial + 1;
+  uint64_t pending_serial = request.release_serial + 1;
   if (pending_serial != 1 &&
       pending_serial % (uint64_t)config.capture_interval != 0)
     return "Waiting for the configured preview capture interval";
+
+  return nullptr;
+}
+
+static const char *
+preview_capture_skip_reason_vulkan(const PreviewCaptureRequest &request) {
+  if (request.graphics_binding != TrackedSession::GraphicsBindingKind::VULKAN)
+    return "Session graphics binding is not classified as Vulkan";
+
+  if ((request.usage_flags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) !=
+          0 &&
+      (request.usage_flags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) == 0)
+    return "Depth/stencil Vulkan swapchains are not supported yet";
+
+  if (!request.has_latest_acquired_index)
+    return "No acquired swapchain image is available yet";
+
+  if (request.image_type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR &&
+      request.image_type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR)
+    return "Swapchain image type is not a Vulkan swapchain image";
+
+  if (request.image_handle_value == 0)
+    return "Tracked Vulkan swapchain image handle is null";
+
+  if (request.face_count != 1)
+    return "Cube and multi-face Vulkan swapchains are not supported yet";
+
+  if (request.sample_count != 1)
+    return "Multisampled Vulkan swapchains are not supported yet";
+
+  PreviewCaptureConfig config = get_preview_capture_config();
+  if (config.capture_interval <= 0)
+    return "Preview capture disabled by XR_DEBUG_GUI_PREVIEW_INTERVAL=0";
+
+  uint64_t pending_serial = request.release_serial + 1;
+  if (pending_serial != 1 &&
+      pending_serial % (uint64_t)config.capture_interval != 0)
+    return "Waiting for the configured preview capture interval";
+
+  if ((request.usage_flags & XR_SWAPCHAIN_USAGE_SAMPLED_BIT) == 0)
+    return "Vulkan preview currently requires XR_SWAPCHAIN_USAGE_SAMPLED_BIT";
+
+  VkImageLayout inferred_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!infer_vulkan_source_layout(request, inferred_layout))
+    return "Vulkan preview could not infer the source image layout";
+
+  if (!get_vulkan_preview_session_state(request.session))
+    return "Vulkan preview session state was not captured from xrCreateSession";
 
   return nullptr;
 }
@@ -192,24 +980,22 @@ static void flip_rgba_rows(std::vector<uint8_t> &rgba, uint32_t width,
   }
 }
 
-static bool capture_opengl_preview(const TrackedSwapchain &swapchain,
+static bool capture_opengl_preview(const PreviewCaptureRequest &request,
                                    TrackedPreviewImage &preview,
                                    std::string &status) {
-  if (!load_preview_gl_functions())
-  {
+  if (!load_preview_gl_functions()) {
     status = "OpenGL preview helpers are unavailable on this thread";
     return false;
   }
 
   PreviewCaptureConfig config = get_preview_capture_config();
-  if (swapchain.width == 0 || swapchain.height == 0)
-  {
+  if (request.width == 0 || request.height == 0) {
     status = "Swapchain extent is zero";
     return false;
   }
 
-  uint32_t preview_width = swapchain.width;
-  uint32_t preview_height = swapchain.height;
+  uint32_t preview_width = request.width;
+  uint32_t preview_height = request.height;
   uint32_t longest_edge = std::max(preview_width, preview_height);
   if (longest_edge > (uint32_t)config.max_edge) {
     float scale = (float)config.max_edge / (float)longest_edge;
@@ -242,23 +1028,22 @@ static bool capture_opengl_preview(const TrackedSwapchain &swapchain,
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)preview_width,
-               (GLsizei)preview_height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-               nullptr);
+               (GLsizei)preview_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
   preview_gl.GenFramebuffers(1, &src_fbo);
   preview_gl.GenFramebuffers(1, &dst_fbo);
 
   preview_gl.BindFramebuffer(GL_READ_FRAMEBUFFER, src_fbo);
-  switch (get_preview_attachment_kind(swapchain)) {
+  switch (get_preview_attachment_kind(request)) {
   case PreviewAttachmentKind::Texture2D:
-    preview_gl.FramebufferTexture2D(
-        GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-        (GLuint)swapchain.images[swapchain.latest_acquired_index].handle_value, 0);
+    preview_gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D,
+                                    (GLuint)request.image_handle_value, 0);
     break;
   case PreviewAttachmentKind::Texture2DArrayLayer0:
     preview_gl.FramebufferTextureLayer(
         GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-        (GLuint)swapchain.images[swapchain.latest_acquired_index].handle_value, 0, 0);
+        (GLuint)request.image_handle_value, 0, 0);
     break;
   case PreviewAttachmentKind::Unsupported:
     break;
@@ -268,14 +1053,14 @@ static bool capture_opengl_preview(const TrackedSwapchain &swapchain,
   preview_gl.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                   GL_TEXTURE_2D, dst_texture, 0);
 
-    GLenum read_status = preview_gl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
-    GLenum draw_status = preview_gl.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
-    if (read_status == GL_FRAMEBUFFER_COMPLETE &&
+  GLenum read_status = preview_gl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+  GLenum draw_status = preview_gl.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+  if (read_status == GL_FRAMEBUFFER_COMPLETE &&
       draw_status == GL_FRAMEBUFFER_COMPLETE) {
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
-    preview_gl.BlitFramebuffer(0, 0, (GLint)swapchain.width,
-                               (GLint)swapchain.height, 0, 0,
+    preview_gl.BlitFramebuffer(0, 0, (GLint)request.width,
+                               (GLint)request.height, 0, 0,
                                (GLint)preview_width, (GLint)preview_height,
                                GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
@@ -284,19 +1069,18 @@ static bool capture_opengl_preview(const TrackedSwapchain &swapchain,
 
     preview.rgba8.resize((size_t)preview_width * (size_t)preview_height * 4);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, (GLsizei)preview_width, (GLsizei)preview_height,
-                 GL_RGBA, GL_UNSIGNED_BYTE, preview.rgba8.data());
+    glReadPixels(0, 0, (GLsizei)preview_width, (GLsizei)preview_height, GL_RGBA,
+                 GL_UNSIGNED_BYTE, preview.rgba8.data());
     flip_rgba_rows(preview.rgba8, preview_width, preview_height);
 
     preview.available = true;
-    preview.capture_serial = swapchain.release_serial + 1;
-    preview.image_index = swapchain.latest_acquired_index;
+    preview.capture_serial = request.release_serial + 1;
+    preview.image_index = request.image_index;
     preview.image_array_index = 0;
     preview.width = preview_width;
     preview.height = preview_height;
-    status = swapchain.array_size > 1
-                 ? "Captured preview from array layer 0"
-                 : "Captured preview";
+    status = request.array_size > 1 ? "Captured preview from array layer 0"
+                                    : "Captured preview";
     success = true;
   } else {
     std::ostringstream oss;
@@ -322,6 +1106,299 @@ static bool capture_opengl_preview(const TrackedSwapchain &swapchain,
   return success;
 }
 
+static bool capture_vulkan_preview(const PreviewCaptureRequest &request,
+                                   TrackedPreviewImage &preview,
+                                   std::string &status) {
+  std::shared_ptr<VulkanPreviewSessionState> state =
+      get_vulkan_preview_session_state(request.session);
+  if (!state) {
+    status =
+        "Vulkan preview session state was not captured from xrCreateSession";
+    return false;
+  }
+
+  std::lock_guard capture_lock(state->mutex);
+  if (!ensure_vulkan_preview_static_resources(*state, status))
+    return false;
+
+  PreviewCaptureConfig config = get_preview_capture_config();
+  if (request.width == 0 || request.height == 0) {
+    status = "Swapchain extent is zero";
+    return false;
+  }
+
+  uint32_t preview_width = request.width;
+  uint32_t preview_height = request.height;
+  uint32_t longest_edge = std::max(preview_width, preview_height);
+  if (longest_edge > (uint32_t)config.max_edge) {
+    float scale = (float)config.max_edge / (float)longest_edge;
+    preview_width = std::max(1u, (uint32_t)(preview_width * scale));
+    preview_height = std::max(1u, (uint32_t)(preview_height * scale));
+  }
+
+  bool recreated_target = false;
+  if (!ensure_vulkan_preview_target_resources(
+          *state, preview_width, preview_height, recreated_target, status)) {
+    return false;
+  }
+
+  VkImage source_image = unpack_handle<VkImage>(request.image_handle_value);
+  if (source_image == VK_NULL_HANDLE) {
+    status = "Tracked Vulkan swapchain image handle is null";
+    return false;
+  }
+
+  VkImageLayout source_original_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!infer_vulkan_source_layout(request, source_original_layout)) {
+    status = "Vulkan preview could not infer the source image layout";
+    return false;
+  }
+
+  VkDevice device = state->binding.device;
+  VkImageView source_image_view = VK_NULL_HANDLE;
+  auto cleanup_source_image_view = [&] {
+    if (source_image_view != VK_NULL_HANDLE) {
+      vkDestroyImageView(device, source_image_view, nullptr);
+      source_image_view = VK_NULL_HANDLE;
+    }
+  };
+
+  VkImageViewCreateInfo source_image_view_info{
+      VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  source_image_view_info.image = source_image;
+  source_image_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  source_image_view_info.format = (VkFormat)request.format;
+  source_image_view_info.subresourceRange.aspectMask =
+      VK_IMAGE_ASPECT_COLOR_BIT;
+  source_image_view_info.subresourceRange.baseMipLevel = 0;
+  source_image_view_info.subresourceRange.levelCount = 1;
+  source_image_view_info.subresourceRange.baseArrayLayer = 0;
+  source_image_view_info.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(device, &source_image_view_info, nullptr,
+                        &source_image_view) != VK_SUCCESS) {
+    status = "Failed to create the Vulkan preview source image view";
+    return false;
+  }
+
+  VkDescriptorImageInfo descriptor_image_info{};
+  descriptor_image_info.sampler = state->sampler;
+  descriptor_image_info.imageView = source_image_view;
+  descriptor_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+  VkWriteDescriptorSet descriptor_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  descriptor_write.dstSet = state->descriptor_set;
+  descriptor_write.dstBinding = 0;
+  descriptor_write.descriptorCount = 1;
+  descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  descriptor_write.pImageInfo = &descriptor_image_info;
+  vkUpdateDescriptorSets(device, 1, &descriptor_write, 0, nullptr);
+
+  if (vkWaitForFences(device, 1, &state->fence, VK_TRUE, UINT64_MAX) !=
+      VK_SUCCESS) {
+    cleanup_source_image_view();
+    status = "Failed to wait for the Vulkan preview fence";
+    return false;
+  }
+  if (vkResetFences(device, 1, &state->fence) != VK_SUCCESS) {
+    cleanup_source_image_view();
+    status = "Failed to reset the Vulkan preview fence";
+    return false;
+  }
+  if (vkResetCommandBuffer(state->command_buffer, 0) != VK_SUCCESS) {
+    cleanup_source_image_view();
+    status = "Failed to reset the Vulkan preview command buffer";
+    return false;
+  }
+
+  VkCommandBufferBeginInfo begin_info{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vkBeginCommandBuffer(state->command_buffer, &begin_info) != VK_SUCCESS) {
+    cleanup_source_image_view();
+    status = "Failed to begin recording the Vulkan preview command buffer";
+    return false;
+  }
+
+  VkImageMemoryBarrier source_to_shader_read{
+      VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  source_to_shader_read.srcAccessMask =
+      VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+  source_to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  source_to_shader_read.oldLayout = source_original_layout;
+  source_to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  source_to_shader_read.image = source_image;
+  source_to_shader_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  source_to_shader_read.subresourceRange.baseMipLevel = 0;
+  source_to_shader_read.subresourceRange.levelCount = 1;
+  source_to_shader_read.subresourceRange.baseArrayLayer = 0;
+  source_to_shader_read.subresourceRange.layerCount = 1;
+  vkCmdPipelineBarrier(state->command_buffer,
+                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &source_to_shader_read);
+
+  VkImageMemoryBarrier destination_to_color_attachment{
+      VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  destination_to_color_attachment.srcAccessMask =
+      recreated_target ? 0 : VK_ACCESS_TRANSFER_READ_BIT;
+  destination_to_color_attachment.dstAccessMask =
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  destination_to_color_attachment.oldLayout =
+      recreated_target ? VK_IMAGE_LAYOUT_UNDEFINED
+                       : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  destination_to_color_attachment.newLayout =
+      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  destination_to_color_attachment.image = state->destination_image;
+  destination_to_color_attachment.subresourceRange.aspectMask =
+      VK_IMAGE_ASPECT_COLOR_BIT;
+  destination_to_color_attachment.subresourceRange.baseMipLevel = 0;
+  destination_to_color_attachment.subresourceRange.levelCount = 1;
+  destination_to_color_attachment.subresourceRange.baseArrayLayer = 0;
+  destination_to_color_attachment.subresourceRange.layerCount = 1;
+  vkCmdPipelineBarrier(state->command_buffer,
+                       recreated_target ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                        : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
+                       nullptr, 0, nullptr, 1,
+                       &destination_to_color_attachment);
+
+  VkClearValue clear_value{};
+  VkRenderPassBeginInfo render_pass_begin_info{
+      VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  render_pass_begin_info.renderPass = state->render_pass;
+  render_pass_begin_info.framebuffer = state->framebuffer;
+  render_pass_begin_info.renderArea.extent = {preview_width, preview_height};
+  render_pass_begin_info.clearValueCount = 1;
+  render_pass_begin_info.pClearValues = &clear_value;
+
+  vkCmdBeginRenderPass(state->command_buffer, &render_pass_begin_info,
+                       VK_SUBPASS_CONTENTS_INLINE);
+
+  VkViewport viewport{};
+  viewport.width = (float)preview_width;
+  viewport.height = (float)preview_height;
+  viewport.maxDepth = 1.0f;
+  vkCmdSetViewport(state->command_buffer, 0, 1, &viewport);
+
+  VkRect2D scissor{};
+  scissor.extent = {preview_width, preview_height};
+  vkCmdSetScissor(state->command_buffer, 0, 1, &scissor);
+
+  vkCmdBindPipeline(state->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    state->pipeline);
+  vkCmdBindDescriptorSets(
+      state->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+      state->pipeline_layout, 0, 1, &state->descriptor_set, 0, nullptr);
+  vkCmdDraw(state->command_buffer, 3, 1, 0, 0);
+  vkCmdEndRenderPass(state->command_buffer);
+
+  VkImageMemoryBarrier destination_to_transfer_src{
+      VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  destination_to_transfer_src.srcAccessMask =
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  destination_to_transfer_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  destination_to_transfer_src.oldLayout =
+      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  destination_to_transfer_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  destination_to_transfer_src.image = state->destination_image;
+  destination_to_transfer_src.subresourceRange.aspectMask =
+      VK_IMAGE_ASPECT_COLOR_BIT;
+  destination_to_transfer_src.subresourceRange.baseMipLevel = 0;
+  destination_to_transfer_src.subresourceRange.levelCount = 1;
+  destination_to_transfer_src.subresourceRange.baseArrayLayer = 0;
+  destination_to_transfer_src.subresourceRange.layerCount = 1;
+  vkCmdPipelineBarrier(state->command_buffer,
+                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &destination_to_transfer_src);
+
+  VkImageMemoryBarrier source_restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  source_restore.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  source_restore.dstAccessMask = 0;
+  source_restore.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  source_restore.newLayout = source_original_layout;
+  source_restore.image = source_image;
+  source_restore.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  source_restore.subresourceRange.baseMipLevel = 0;
+  source_restore.subresourceRange.levelCount = 1;
+  source_restore.subresourceRange.baseArrayLayer = 0;
+  source_restore.subresourceRange.layerCount = 1;
+  vkCmdPipelineBarrier(state->command_buffer,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &source_restore);
+
+  VkBufferImageCopy copy_region{};
+  copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy_region.imageSubresource.mipLevel = 0;
+  copy_region.imageSubresource.baseArrayLayer = 0;
+  copy_region.imageSubresource.layerCount = 1;
+  copy_region.imageExtent = {preview_width, preview_height, 1};
+  vkCmdCopyImageToBuffer(state->command_buffer, state->destination_image,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         state->staging_buffer, 1, &copy_region);
+
+  VkBufferMemoryBarrier buffer_to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  buffer_to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  buffer_to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  buffer_to_host.buffer = state->staging_buffer;
+  buffer_to_host.offset = 0;
+  buffer_to_host.size = state->staging_buffer_size;
+  vkCmdPipelineBarrier(state->command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                       &buffer_to_host, 0, nullptr);
+
+  if (vkEndCommandBuffer(state->command_buffer) != VK_SUCCESS) {
+    cleanup_source_image_view();
+    status = "Failed to end the Vulkan preview command buffer";
+    return false;
+  }
+
+  VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &state->command_buffer;
+  if (vkQueueSubmit(state->queue, 1, &submit_info, state->fence) !=
+      VK_SUCCESS) {
+    cleanup_source_image_view();
+    status = "Failed to submit the Vulkan preview commands";
+    return false;
+  }
+  if (vkWaitForFences(device, 1, &state->fence, VK_TRUE, UINT64_MAX) !=
+      VK_SUCCESS) {
+    cleanup_source_image_view();
+    status = "Failed to wait for the submitted Vulkan preview commands";
+    return false;
+  }
+
+  if (!state->staging_memory_coherent) {
+    VkMappedMemoryRange mapped_range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    mapped_range.memory = state->staging_memory;
+    mapped_range.offset = 0;
+    mapped_range.size = state->staging_buffer_size;
+    if (vkInvalidateMappedMemoryRanges(device, 1, &mapped_range) !=
+        VK_SUCCESS) {
+      cleanup_source_image_view();
+      status = "Failed to invalidate the Vulkan preview staging memory";
+      return false;
+    }
+  }
+
+  preview.rgba8.resize((size_t)preview_width * (size_t)preview_height * 4);
+  std::memcpy(preview.rgba8.data(), state->mapped_staging,
+              preview.rgba8.size());
+  preview.available = true;
+  preview.capture_serial = request.release_serial + 1;
+  preview.image_index = request.image_index;
+  preview.image_array_index = 0;
+  preview.width = preview_width;
+  preview.height = preview_height;
+  status = request.array_size > 1 ? "Captured Vulkan preview from array layer 0"
+                                  : "Captured Vulkan preview";
+
+  cleanup_source_image_view();
+  return true;
+}
+
 static TrackedSwapchainImage
 track_swapchain_image(const XrSwapchainImageBaseHeader &image) {
   TrackedSwapchainImage tracked;
@@ -330,6 +1407,10 @@ track_swapchain_image(const XrSwapchainImageBaseHeader &image) {
   if (image.type == XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR) {
     auto &gl_image = reinterpret_cast<const XrSwapchainImageOpenGLKHR &>(image);
     tracked.handle_value = (uint64_t)gl_image.image;
+  } else if (image.type == XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR ||
+             image.type == XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR) {
+    auto &vk_image = reinterpret_cast<const XrSwapchainImageVulkanKHR &>(image);
+    tracked.handle_value = pack_handle(vk_image.image);
   }
 
   return tracked;
@@ -785,26 +1866,40 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
   if (data == nullptr)
     return XR_ERROR_HANDLE_INVALID;
 
+  PreviewCaptureRequest request;
   TrackedPreviewImage captured_preview;
   std::string preview_status;
   bool has_captured_preview = false;
   bool attempted_preview_capture = false;
   {
     std::shared_lock lock(data->state_mutex);
-    auto tracked_it = data->swapchains.find(swapchain);
-    if (tracked_it != data->swapchains.end()) {
-      auto session_it = data->sessions.find(tracked_it->second.session);
-      const char *skip_reason = preview_capture_skip_reason(
-          session_it != data->sessions.end() ? &session_it->second : nullptr,
-          tracked_it->second);
-      if (skip_reason == nullptr) {
-        attempted_preview_capture = true;
-        has_captured_preview =
-            capture_opengl_preview(tracked_it->second, captured_preview,
-                                   preview_status);
-      } else {
-        preview_status = skip_reason;
+    if (build_preview_capture_request(data, swapchain, request)) {
+      const char *skip_reason = nullptr;
+      switch (request.graphics_binding) {
+      case TrackedSession::GraphicsBindingKind::OPENGL:
+        skip_reason = preview_capture_skip_reason_opengl(request);
+        if (skip_reason == nullptr) {
+          attempted_preview_capture = true;
+          has_captured_preview =
+              capture_opengl_preview(request, captured_preview, preview_status);
+        }
+        break;
+      case TrackedSession::GraphicsBindingKind::VULKAN:
+        skip_reason = preview_capture_skip_reason_vulkan(request);
+        if (skip_reason == nullptr) {
+          attempted_preview_capture = true;
+          has_captured_preview =
+              capture_vulkan_preview(request, captured_preview, preview_status);
+        }
+        break;
+      default:
+        skip_reason =
+            "Session graphics binding is not supported for preview capture";
+        break;
       }
+
+      if (skip_reason != nullptr)
+        preview_status = skip_reason;
     }
   }
 
@@ -828,9 +1923,9 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
       tracked_it->second.release_serial++;
       if (has_captured_preview) {
         tracked.latest_preview = std::move(captured_preview);
-        tracked.preview_images[make_preview_key(tracked.latest_preview.image_index,
-                                               tracked.latest_preview.image_array_index)] =
-            tracked.latest_preview;
+        tracked.preview_images[make_preview_key(
+            tracked.latest_preview.image_index,
+            tracked.latest_preview.image_array_index)] = tracked.latest_preview;
       }
 
       if (attempted_preview_capture) {
@@ -871,8 +1966,8 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
             << (uint64_t)tracked.session << std::dec
             << " attempts=" << tracked.preview_attempt_count
             << " success=" << tracked.preview_success_count
-            << " skipped=" << tracked.preview_skip_count
-            << " status=\"" << tracked.preview_status << "\"";
+            << " skipped=" << tracked.preview_skip_count << " status=\""
+            << tracked.preview_status << "\"";
         preview_log_line = oss.str();
       }
     }

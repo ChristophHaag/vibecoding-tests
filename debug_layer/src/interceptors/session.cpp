@@ -5,6 +5,12 @@
 #include "../gui/gui_main.h"
 #include "../instance_data.h"
 
+// clang-format off
+#define XR_USE_GRAPHICS_API_VULKAN
+#include <vulkan/vulkan.h>
+#include <openxr/openxr_platform.h>
+// clang-format on
+
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -14,6 +20,11 @@ namespace debug_layer {
 
 // Forward declaration of helper defined in actions.cpp.
 void refresh_active_profiles(InstanceData *data, XrSession session);
+
+// Forward declarations of helpers defined in frame.cpp.
+void register_preview_capture_session_binding(
+    XrSession session, const XrSessionCreateInfo *create_info);
+void destroy_preview_capture_session_resources(XrSession session);
 
 static TrackedSession::GraphicsBindingKind
 classify_graphics_binding(const XrSessionCreateInfo *createInfo,
@@ -82,6 +93,8 @@ XrResult XRAPI_CALL Layer_xrCreateSession(XrInstance instance,
     data->sessions[*session] = ts;
   }
 
+  register_preview_capture_session_binding(*session, createInfo);
+
   // Launch GUI thread (deferred to here to avoid interfering with app's
   // windowing init)
   const char *disable_env = std::getenv("XR_DEBUG_GUI_DISABLE");
@@ -100,6 +113,8 @@ XrResult XRAPI_CALL Layer_xrDestroySession(XrSession session) {
   std::cerr << "[XR_APILAYER_DEBUG_gui] xrDestroySession" << std::endl;
 
   XrResult result = data->next.xrDestroySession(session);
+
+  destroy_preview_capture_session_resources(session);
 
   {
     std::unique_lock lock(data->state_mutex);
