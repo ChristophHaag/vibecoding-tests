@@ -162,3 +162,20 @@ gui/gui_perf.h/.cpp     Performance observatory: stacked bars, real-time timelin
 - The Composition Layers panel uses retained previews and retained recent-layer state to reduce flicker from rotating swapchain indices and temporarily omitted layers.
 - Use the `build-ninja/xr-with-debug-gui.sh` wrapper for smoke tests; it points `XR_API_LAYER_PATH` at the manifest-only Ninja build directory and avoids loader warnings from unrelated files.
 - Layout resets: delete `~/.config/openxr_debug_gui/imgui.ini`
+
+## Licensing
+
+This repository is presented as 100% AI-written. That also means the provenance
+of any given line is fundamentally uncertain: an LLM cannot reliably prove that
+it did not reproduce material derived from copyleft, proprietary, or otherwise
+incompatible sources.
+
+For that reason, any MIT notices in individual files should not be treated as a
+trustworthy provenance guarantee. In plain terms: they claim an MIT licensing
+state that cannot actually be verified from the way this repository was
+produced.
+
+The intended dedication for this repository is public domain, but with an
+explicit caveat that the true upstream licensing status of generated content is
+unknown. If you need clean provenance or a defensible license chain, do not rely
+on this repository without performing your own review and replacement work.
