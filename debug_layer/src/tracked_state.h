@@ -309,6 +309,7 @@ struct TrackedViewPose {
   bool valid = false;
   XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}};
   XrFovf fov = {0, 0, 0, 0};
+  XrSpace base_space = XR_NULL_HANDLE;
   std::string label;
 };
 

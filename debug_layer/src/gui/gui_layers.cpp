@@ -3,6 +3,8 @@
 
 #include "gui_layers.h"
 
+#include "gui_preview_cache.h"
+
 #include "../instance_data.h"
 
 #include <SDL3/SDL_opengl.h>
@@ -12,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -25,32 +28,6 @@ namespace {
 
 constexpr uint64_t kCompositionLayerRetentionFrames = 6;
 
-uint64_t make_preview_key(uint32_t image_index, uint32_t image_array_index) {
-  return ((uint64_t)image_array_index << 32) | (uint64_t)image_index;
-}
-
-struct PreviewTextureKey {
-  uint64_t swapchain = 0;
-  uint32_t image_index = 0;
-  uint32_t image_array_index = 0;
-
-  bool operator==(const PreviewTextureKey &other) const {
-    return swapchain == other.swapchain && image_index == other.image_index &&
-           image_array_index == other.image_array_index;
-  }
-};
-
-struct PreviewTextureKeyHash {
-  size_t operator()(const PreviewTextureKey &key) const {
-    size_t hash = std::hash<uint64_t>{}(key.swapchain);
-    hash ^= std::hash<uint32_t>{}(key.image_index) + 0x9e3779b9 + (hash << 6) +
-            (hash >> 2);
-    hash ^= std::hash<uint32_t>{}(key.image_array_index) + 0x9e3779b9 +
-            (hash << 6) + (hash >> 2);
-    return hash;
-  }
-};
-
 struct DisplayedLayer {
   const TrackedCompositionLayer *layer = nullptr;
   uint64_t source_frame_number = 0;
@@ -60,21 +37,11 @@ struct DisplayedLayer {
 
 } // namespace
 
-struct GuiPreviewTexture {
-  GLuint texture = 0;
-  uint64_t capture_serial = 0;
-  uint32_t width = 0;
-  uint32_t height = 0;
-};
-
 struct PreviewDisplayState {
   bool inspect_mode = false;
   float zoom = 1.0f;
 };
 
-static std::unordered_map<PreviewTextureKey, GuiPreviewTexture,
-                          PreviewTextureKeyHash>
-    g_preview_textures;
 static std::unordered_map<PreviewTextureKey, PreviewDisplayState,
                           PreviewTextureKeyHash>
     g_preview_display_state;
@@ -139,49 +106,6 @@ static const char *space_label(const InstanceData *data, XrSpace space,
 
   format_handle(fallback, fallback_size, (uint64_t)space);
   return fallback;
-}
-
-static const TrackedPreviewImage *find_preview_for_sub_image(
-    const TrackedSwapchain &swapchain,
-    const TrackedCompositionSubImage &sub_image) {
-  if (sub_image.has_image_index) {
-    auto preview_it = swapchain.preview_images.find(
-        make_preview_key(sub_image.image_index, sub_image.image_array_index));
-    if (preview_it != swapchain.preview_images.end() &&
-        preview_it->second.available)
-      return &preview_it->second;
-  }
-
-  if (swapchain.latest_preview.available)
-    return &swapchain.latest_preview;
-
-  return nullptr;
-}
-
-static GLuint ensure_gui_preview_texture(const PreviewTextureKey &cache_key,
-                                         const TrackedPreviewImage &preview) {
-  GuiPreviewTexture &entry = g_preview_textures[cache_key];
-  if (entry.texture == 0)
-    glGenTextures(1, &entry.texture);
-
-  if (entry.capture_serial != preview.capture_serial ||
-      entry.width != preview.width || entry.height != preview.height) {
-    glBindTexture(GL_TEXTURE_2D, entry.texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)preview.width,
-                 (GLsizei)preview.height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                 preview.rgba8.data());
-
-    entry.capture_serial = preview.capture_serial;
-    entry.width = preview.width;
-    entry.height = preview.height;
-  }
-
-  return entry.texture;
 }
 
 static std::string sub_image_identity_key(const TrackedCompositionSubImage &sub) {
@@ -437,18 +361,14 @@ static void render_sub_image(const InstanceData *data, const char *heading,
   ImGui::Text("Array index: %u", sub_image.image_array_index);
 
   if (swapchain != nullptr) {
-    const TrackedPreviewImage *preview = find_preview_for_sub_image(*swapchain,
-                                                                    sub_image);
+    PreviewLookupResult preview_lookup =
+        gui_lookup_preview_for_sub_image(*swapchain, sub_image);
+    const TrackedPreviewImage *preview = preview_lookup.preview;
     bool has_matching_preview = preview != nullptr && preview->available;
-    PreviewTextureKey preview_texture_key = {
-        (uint64_t)sub_image.swapchain,
-        preview != nullptr ? preview->image_index : 0,
-        preview != nullptr ? preview->image_array_index : 0,
-    };
+    PreviewTextureKey preview_texture_key = preview_lookup.texture_key;
     GLuint preview_texture = 0;
     if (has_matching_preview)
-      preview_texture = ensure_gui_preview_texture(preview_texture_key,
-                                                  *preview);
+      preview_texture = gui_ensure_preview_texture(preview_texture_key, *preview);
 
     ImGui::Text("Swapchain extent: %ux%u", swapchain->width, swapchain->height);
     ImGui::Text("Format: %#llx  Samples: %u  Mips: %u",
@@ -514,16 +434,11 @@ static void render_sub_image(const InstanceData *data, const char *heading,
 void gui_render_layers_panel(InstanceData *data) {
   std::shared_lock lock(data->state_mutex);
 
-  for (auto it = g_preview_textures.begin(); it != g_preview_textures.end();) {
-    if (data->swapchains.find((XrSwapchain)it->first.swapchain) ==
-        data->swapchains.end()) {
-      if (it->second.texture != 0)
-        glDeleteTextures(1, &it->second.texture);
-      it = g_preview_textures.erase(it);
-    } else {
-      ++it;
-    }
-  }
+  std::unordered_set<uint64_t> live_swapchains;
+  live_swapchains.reserve(data->swapchains.size());
+  for (const auto &[swapchain_handle, swapchain] : data->swapchains)
+    live_swapchains.insert((uint64_t)swapchain_handle);
+  gui_prune_preview_textures(live_swapchains);
 
   for (auto it = g_preview_display_state.begin();
        it != g_preview_display_state.end();) {

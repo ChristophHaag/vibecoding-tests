@@ -99,9 +99,12 @@ my_xr_app
 
 - The 3D Spaces panel already has the math and GL infrastructure needed to draw extra world-space geometry.
 - Composition layer content should be treated as visualization geometry derived from tracked layer submissions, not as part of the application render path.
+- The scene should pick one consistent root space, then resolve tracked spaces, view poses, and layer spaces into that root before drawing. Mixing raw `xrLocateSpace` results from different base spaces will misplace geometry.
 - Projection layers can be visualized by rendering their captured sub-images onto geometry placed at the far end of each tracked frustum.
 - Quad layers can be visualized by rendering their captured sub-image onto a world-space rectangle transformed by the layer pose and size.
 - Because layers may be omitted from some `xrEndFrame` calls, the 3D visualization should use the same retained-live-layer model as the Composition Layers panel rather than dropping geometry immediately.
+- The 2D and 3D panels should reuse the same GUI-side preview texture cache so the same captured thumbnail is not uploaded twice when both panels are open.
+- The 3D scene needs a depth attachment once textured layer quads are added, otherwise world-space previews sort incorrectly against each other and against the line overlays.
 
 ## Architecture
 

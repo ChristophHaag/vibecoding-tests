@@ -130,8 +130,11 @@ main dockspace instead of floating.
 ## 3D Composition Rendering
 
 - The existing 3D Spaces panel already owns a dedicated GL FBO, camera, and line renderer; composition-layer world rendering should build on that instead of opening a second scene panel.
+- Resolve spaces, view poses, and composition layers into one chosen scene-root space before drawing. Raw `latest_location.pose` values are only valid relative to `located_relative_to` and are not globally comparable by themselves.
 - Projection views should be visualized using the tracked `view.pose` + `view.fov` geometry, with textured surfaces placed on the far plane of the displayed frustum.
 - Quad layers should be visualized as textured rectangles transformed by the layer pose and size in the layer's tracked space.
+- The 3D panel should reuse the same GUI preview texture cache as the Composition Layers panel instead of uploading a second copy of the same thumbnail.
+- Once textured geometry is present, keep a depth attachment on the scene FBO and depth test enabled for the world render pass so layer previews sort correctly in 3D.
 - Expect multiple composition layers to reuse the same swapchain image across frames; do not assume every frame produces a new preview.
 
 ## Testing

@@ -81,6 +81,7 @@ add_library(XrApiLayer_debug_gui SHARED
     src/gui/gui_actions.cpp
     src/gui/gui_layers.cpp
     src/gui/gui_perf.cpp
+    src/gui/gui_preview_cache.cpp
     src/gui/gui_spaces.cpp
 )
 

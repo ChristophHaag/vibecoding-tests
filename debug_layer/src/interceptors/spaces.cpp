@@ -202,6 +202,7 @@ XrResult XRAPI_CALL Layer_xrLocateViews(XrSession session,
             data->view_poses[i].valid = pos_valid && orient_valid;
             data->view_poses[i].pose = views[i].pose;
             data->view_poses[i].fov = views[i].fov;
+            data->view_poses[i].base_space = viewLocateInfo->space;
             data->view_poses[i].label = "View " + std::to_string(i);
         }
 

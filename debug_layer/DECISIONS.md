@@ -270,7 +270,8 @@ acquires a shared (read) lock when rendering; interceptors acquire a unique
 1. **Pointer lifetime safety.** `xrEndFrame` layer arrays and chained structs are owned by the application, so the layer deep-copies the relevant composition-layer state before returning.
 2. **Correct GL ownership.** Reading swapchain textures is safest on the application thread before `xrReleaseSwapchainImage`, where the image is still owned by the app and the app's GL context is current.
 3. **Index-rotation stability.** Many apps rotate through swapchain image indices. Caching only a single newest preview per swapchain caused flicker when the GUI happened to inspect a different sub-image than the last released one. The cache is therefore keyed by `(swapchain, image index, array index)`.
-4. **UI stability.** Some apps omit a composition layer from individual `xrEndFrame` calls. The Composition Layers panel retains recently seen layers for a few frames and marks them stale instead of dropping them immediately.
+4. **UI stability.** Some apps omit a composition layer from individual `xrEndFrame` calls. The Composition Layers panel and the 3D Spaces panel retain recently seen layers for a few frames and mark them stale instead of dropping them immediately.
+5. **GUI upload reuse.** The GUI-side GL texture cache is shared between the 2D Composition Layers panel and the 3D Spaces panel so opening both views does not duplicate texture uploads for the same captured preview.
 
 **Current limits:**
 
@@ -315,6 +316,15 @@ The 3D space visualization renders:
 **Future:** If controller models or environment meshes are desired, a more
 capable renderer could be added to `gui/gui_spaces.cpp` without affecting
 other components.
+
+The composition-layer world rendering added later keeps the same lightweight
+approach but extends it with:
+
+- a single chosen scene-root space, with tracked spaces and composition layers
+   resolved into that root before drawing
+- a depth-backed FBO so textured layer quads sort correctly in 3D
+- textured quads only for projection and quad layers, while the rest remain
+   metadata-only until their geometry model is implemented
 
 ---
 
