@@ -91,6 +91,11 @@ GLuint gui_ensure_preview_texture(const PreviewTextureKey &cache_key,
   return entry.texture;
 }
 
+GLuint gui_lookup_cached_preview_texture(const PreviewTextureKey &cache_key) {
+  auto it = g_preview_textures.find(cache_key);
+  return it != g_preview_textures.end() ? it->second.texture : 0;
+}
+
 void gui_prune_preview_textures(
     const std::unordered_set<uint64_t> &live_swapchains) {
   for (auto it = g_preview_textures.begin(); it != g_preview_textures.end();) {

@@ -30,6 +30,7 @@ constexpr uint64_t kCompositionLayerRetentionFrames = 6;
 
 struct DisplayedLayer {
   const TrackedCompositionLayer *layer = nullptr;
+  std::string identity_key;
   uint64_t source_frame_number = 0;
   size_t source_layer_index = 0;
   uint64_t stale_frame_count = 0;
@@ -38,12 +39,15 @@ struct DisplayedLayer {
 } // namespace
 
 struct PreviewDisplayState {
+  uint64_t swapchain = 0;
   bool inspect_mode = false;
   float zoom = 1.0f;
+  PreviewTextureKey last_texture_key = {};
+  uint32_t last_preview_width = 0;
+  uint32_t last_preview_height = 0;
 };
 
-static std::unordered_map<PreviewTextureKey, PreviewDisplayState,
-                          PreviewTextureKeyHash>
+static std::unordered_map<std::string, PreviewDisplayState>
     g_preview_display_state;
 
 static const char *blend_mode_to_str(XrEnvironmentBlendMode mode) {
@@ -160,6 +164,7 @@ collect_display_layers(const std::deque<TrackedCompositionFrame> &frames) {
 
       DisplayedLayer displayed;
       displayed.layer = &layer;
+      displayed.identity_key = key;
       displayed.source_frame_number = frame_it->frame_number;
       displayed.source_layer_index = layer_index;
       displayed.stale_frame_count = stale_frame_count;
@@ -252,25 +257,44 @@ static void draw_image_rect_visualization(
 }
 
 static void render_preview_inspector(
-    const char *id, const PreviewTextureKey &cache_key,
-    const TrackedPreviewImage &preview, GLuint preview_texture,
+    const std::string &slot_key, const char *id,
+    const TrackedPreviewImage *preview, const PreviewTextureKey *cache_key,
+    GLuint preview_texture,
     int32_t full_width, int32_t full_height,
     const TrackedCompositionSubImage &sub_image) {
-  PreviewDisplayState &display = g_preview_display_state[cache_key];
+  PreviewDisplayState &display = g_preview_display_state[slot_key];
+  display.swapchain = (uint64_t)sub_image.swapchain;
+
+  if (preview != nullptr && cache_key != nullptr && preview_texture != 0) {
+    display.last_texture_key = *cache_key;
+    display.last_preview_width = preview->width;
+    display.last_preview_height = preview->height;
+  }
+
+  GLuint effective_texture = preview_texture;
+  if (effective_texture == 0 && display.last_texture_key.swapchain != 0)
+    effective_texture = gui_lookup_cached_preview_texture(display.last_texture_key);
+
+  uint32_t preview_width = preview != nullptr ? preview->width
+                                              : display.last_preview_width;
+  uint32_t preview_height = preview != nullptr ? preview->height
+                                               : display.last_preview_height;
+  bool has_preview_pixels = effective_texture != 0 && preview_width > 0 &&
+                            preview_height > 0;
 
   if (!display.inspect_mode) {
+    ImGui::PushID(slot_key.c_str());
     draw_image_rect_visualization(id, full_width, full_height, sub_image,
-                                  preview_texture);
+                                  effective_texture);
     if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
       display.inspect_mode = true;
       display.zoom = 1.0f;
     }
+    ImGui::PopID();
     return;
   }
 
-  ImGui::PushID((void *)(uintptr_t)cache_key.swapchain);
-  ImGui::PushID((int)cache_key.image_index);
-  ImGui::PushID((int)cache_key.image_array_index);
+  ImGui::PushID(slot_key.c_str());
   if (ImGui::SmallButton("Fit View")) {
     display.inspect_mode = false;
     display.zoom = 1.0f;
@@ -284,21 +308,28 @@ static void render_preview_inspector(
     display.zoom = 1.0f;
   ImGui::TextDisabled("Mouse wheel zooms. Click the image to return to fit view.");
 
-  ImVec2 image_size(preview.width * display.zoom, preview.height * display.zoom);
-  float child_height = std::min(420.0f, std::max(160.0f, image_size.y + 12.0f));
+  ImVec2 image_size((float)preview_width * display.zoom,
+                    (float)preview_height * display.zoom);
+  float child_height = 420.0f;
   ImGui::BeginChild("preview_inspect", ImVec2(0.0f, child_height),
                     ImGuiChildFlags_Borders,
                     ImGuiWindowFlags_HorizontalScrollbar);
-  ImGui::Image((ImTextureID)(intptr_t)preview_texture, image_size);
+  ImVec2 min;
+  if (has_preview_pixels) {
+    ImGui::Image((ImTextureID)(intptr_t)effective_texture, image_size);
 
-  ImDrawList *draw_list = ImGui::GetWindowDrawList();
-  ImVec2 min = ImGui::GetItemRectMin();
-  draw_list->AddRect(min, ImVec2(min.x + image_size.x, min.y + image_size.y),
-                     IM_COL32(160, 165, 175, 255), 0.0f, 0, 1.0f);
-  draw_sub_image_overlay(draw_list, min, image_size, full_width, full_height,
-                         sub_image);
+    ImDrawList *draw_list = ImGui::GetWindowDrawList();
+    min = ImGui::GetItemRectMin();
+    draw_list->AddRect(min, ImVec2(min.x + image_size.x, min.y + image_size.y),
+                       IM_COL32(160, 165, 175, 255), 0.0f, 0, 1.0f);
+    draw_sub_image_overlay(draw_list, min, image_size, full_width, full_height,
+                           sub_image);
+  } else {
+    ImGui::Dummy(ImVec2(0.0f, 0.0f));
+    ImGui::TextDisabled("Preview texture is not currently available.");
+  }
 
-  if (ImGui::IsItemHovered()) {
+  if (has_preview_pixels && ImGui::IsItemHovered()) {
     float wheel = ImGui::GetIO().MouseWheel;
     if (wheel != 0.0f)
       display.zoom = std::clamp(display.zoom * (wheel > 0.0f ? 1.2f : 1.0f / 1.2f),
@@ -312,17 +343,17 @@ static void render_preview_inspector(
     ImVec2 mouse = ImGui::GetIO().MousePos;
     int pixel_x = (int)std::floor((mouse.x - min.x) / display.zoom);
     int pixel_y = (int)std::floor((mouse.y - min.y) / display.zoom);
-    if (pixel_x >= 0 && pixel_y >= 0 && pixel_x < (int)preview.width &&
-        pixel_y < (int)preview.height) {
+    if (preview != nullptr && pixel_x >= 0 && pixel_y >= 0 &&
+        pixel_x < (int)preview->width && pixel_y < (int)preview->height) {
       size_t pixel_index =
-          ((size_t)pixel_y * (size_t)preview.width + (size_t)pixel_x) * 4;
-      if (pixel_index + 3 < preview.rgba8.size()) {
+          ((size_t)pixel_y * (size_t)preview->width + (size_t)pixel_x) * 4;
+      if (pixel_index + 3 < preview->rgba8.size()) {
         ImGui::BeginTooltip();
         ImGui::Text("Pixel (%d, %d)", pixel_x, pixel_y);
-        ImGui::Text("RGBA = (%u, %u, %u, %u)", preview.rgba8[pixel_index + 0],
-                    preview.rgba8[pixel_index + 1],
-                    preview.rgba8[pixel_index + 2],
-                    preview.rgba8[pixel_index + 3]);
+        ImGui::Text("RGBA = (%u, %u, %u, %u)", preview->rgba8[pixel_index + 0],
+                    preview->rgba8[pixel_index + 1],
+                    preview->rgba8[pixel_index + 2],
+                    preview->rgba8[pixel_index + 3]);
         ImGui::Text("Zoom %.2fx", display.zoom);
         ImGui::EndTooltip();
       }
@@ -331,13 +362,11 @@ static void render_preview_inspector(
 
   ImGui::EndChild();
   ImGui::PopID();
-  ImGui::PopID();
-  ImGui::PopID();
 }
 
 static void render_sub_image(const InstanceData *data, const char *heading,
                              const TrackedCompositionSubImage &sub_image,
-                             int tree_suffix) {
+                             const std::string &preview_slot_key) {
   if (sub_image.swapchain == XR_NULL_HANDLE) {
     ImGui::TextDisabled("%s: no swapchain", heading);
     return;
@@ -387,17 +416,10 @@ static void render_sub_image(const InstanceData *data, const char *heading,
       ImGui::Text("Native image handle: %s", image_handle_buf);
     }
 
-    char viz_id[32];
-    std::snprintf(viz_id, sizeof(viz_id), "##rect_%s_%d", heading, tree_suffix);
-    if (has_matching_preview) {
-      render_preview_inspector(viz_id, preview_texture_key, *preview,
-                               preview_texture, (int32_t)swapchain->width,
-                               (int32_t)swapchain->height, sub_image);
-    } else {
-      draw_image_rect_visualization(viz_id, (int32_t)swapchain->width,
-                                    (int32_t)swapchain->height, sub_image,
-                                    preview_texture);
-    }
+    render_preview_inspector(preview_slot_key, "preview_rect", preview,
+                             has_matching_preview ? &preview_texture_key : nullptr,
+                             preview_texture, (int32_t)swapchain->width,
+                             (int32_t)swapchain->height, sub_image);
 
     ImGui::TextDisabled("%s", has_matching_preview
                                  ? "Click preview to inspect at actual pixels."
@@ -465,7 +487,7 @@ void gui_render_layers_panel(InstanceData *data) {
 
   for (auto it = g_preview_display_state.begin();
        it != g_preview_display_state.end();) {
-    if (data->swapchains.find((XrSwapchain)it->first.swapchain) ==
+    if (data->swapchains.find((XrSwapchain)it->second.swapchain) ==
         data->swapchains.end())
       it = g_preview_display_state.erase(it);
     else
@@ -510,8 +532,9 @@ void gui_render_layers_panel(InstanceData *data) {
       const DisplayedLayer &displayed = displayed_layers[layer_list_index];
       const TrackedCompositionLayer &layer = *displayed.layer;
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen;
+      ImGui::PushID(displayed.identity_key.c_str());
       if (ImGui::TreeNodeEx(
-        (void *)(uintptr_t)(layer_list_index + 1), flags,
+        "layer", flags,
         displayed.stale_frame_count == 0
          ? "Layer %zu: %s"
          : "Layer %zu: %s  [stale %llu frame%s]",
@@ -540,7 +563,8 @@ void gui_render_layers_panel(InstanceData *data) {
                       view.fov.angleRight, view.fov.angleUp,
                       view.fov.angleDown);
           render_sub_image(data, "Color sub-image", view.sub_image,
-                           (int)(layer_list_index * 8 + view_index));
+                           displayed.identity_key + ":view:" +
+                               std::to_string(view_index));
         }
         break;
       case XR_TYPE_COMPOSITION_LAYER_QUAD:
@@ -548,7 +572,7 @@ void gui_render_layers_panel(InstanceData *data) {
                     layer.pose.position.y, layer.pose.position.z);
         ImGui::Text("Size: %.3f x %.3f", layer.size.width, layer.size.height);
         render_sub_image(data, "Color sub-image", layer.sub_image,
-                         (int)layer_list_index);
+                         displayed.identity_key + ":sub");
         break;
       case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR:
         ImGui::Text("Pose position: (%.3f, %.3f, %.3f)", layer.pose.position.x,
@@ -556,7 +580,7 @@ void gui_render_layers_panel(InstanceData *data) {
         ImGui::Text("Radius: %.3f  Central angle: %.3f  Aspect ratio: %.3f",
                     layer.radius, layer.central_angle, layer.aspect_ratio);
         render_sub_image(data, "Color sub-image", layer.sub_image,
-                         (int)layer_list_index);
+                         displayed.identity_key + ":sub");
         break;
       case XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR:
         ImGui::Text("Pose position: (%.3f, %.3f, %.3f)", layer.pose.position.x,
@@ -565,7 +589,7 @@ void gui_render_layers_panel(InstanceData *data) {
                     layer.radius, layer.scale_x, layer.scale_y, layer.bias_x,
                     layer.bias_y);
         render_sub_image(data, "Color sub-image", layer.sub_image,
-                         (int)layer_list_index);
+                         displayed.identity_key + ":sub");
         break;
       case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR:
         ImGui::Text("Pose position: (%.3f, %.3f, %.3f)", layer.pose.position.x,
@@ -575,13 +599,13 @@ void gui_render_layers_panel(InstanceData *data) {
             layer.radius, layer.central_angle, layer.upper_vertical_angle,
             layer.lower_vertical_angle);
         render_sub_image(data, "Color sub-image", layer.sub_image,
-                 (int)layer_list_index);
+                         displayed.identity_key + ":sub");
         break;
       case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR:
         ImGui::Text("Pose position: (%.3f, %.3f, %.3f)", layer.pose.position.x,
                     layer.pose.position.y, layer.pose.position.z);
         render_sub_image(data, "Cube sub-image", layer.sub_image,
-                         (int)layer_list_index);
+                         displayed.identity_key + ":sub");
         break;
       default:
         ImGui::TextDisabled(
@@ -591,6 +615,7 @@ void gui_render_layers_panel(InstanceData *data) {
 
       ImGui::TreePop();
     }
+    ImGui::PopID();
   }
 
   ImGui::End();

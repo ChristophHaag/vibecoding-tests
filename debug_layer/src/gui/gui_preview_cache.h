@@ -39,6 +39,8 @@ gui_lookup_preview_for_sub_image(const TrackedSwapchain &swapchain,
 GLuint gui_ensure_preview_texture(const PreviewTextureKey &cache_key,
                                   const TrackedPreviewImage &preview);
 
+GLuint gui_lookup_cached_preview_texture(const PreviewTextureKey &cache_key);
+
 void gui_prune_preview_textures(
   const std::unordered_set<uint64_t> &live_swapchains);
 
