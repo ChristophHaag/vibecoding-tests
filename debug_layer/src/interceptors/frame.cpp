@@ -2758,9 +2758,9 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
         oss << "[XR_APILAYER_DEBUG_gui][preview] swapchain=0x" << std::hex
             << (uint64_t)swapchain << std::dec << " session=0x" << std::hex
             << (uint64_t)tracked.session << std::dec
-            << " attempts=" << tracked.preview_attempt_count
-            << " success=" << tracked.preview_success_count
-            << " skipped=" << tracked.preview_skip_count
+          << " submitted=" << tracked.preview_attempt_count
+          << " completed=" << tracked.preview_success_count
+          << " no_submit=" << tracked.preview_skip_count
             << " inflight=" << tracked.preview_inflight_count << "/"
             << tracked.preview_inflight_peak
             << " app_ms=" << tracked.preview_app_thread_ms_last

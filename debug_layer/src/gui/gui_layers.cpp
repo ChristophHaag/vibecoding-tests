@@ -434,10 +434,13 @@ static void render_sub_image(const InstanceData *data, const char *heading,
       ImGui::TextDisabled("Preview: %s", preview_note_for_swapchain(data, *swapchain));
     }
 
-    ImGui::Text("Preview stats: attempts=%llu success=%llu skipped=%llu",
+    ImGui::Text("Preview stats: submitted=%llu completed=%llu no-submit=%llu",
                 (unsigned long long)swapchain->preview_attempt_count,
                 (unsigned long long)swapchain->preview_success_count,
                 (unsigned long long)swapchain->preview_skip_count);
+    ImGui::TextDisabled(
+      "No-submit means this release did not start a new preview capture."
+      " It includes unsupported, not-ready, throttled, or slot-busy cases.");
     ImGui::Text(
       "Preview timing: app-thread %.3f / %.3f / %.3f ms (last/avg/max)",
       swapchain->preview_app_thread_ms_last,
