@@ -1,15 +1,29 @@
 # SPDX-License-Identifier: MIT
-# Builds monado-remote-client against the monado submodule's headers only.
-# No add_subdirectory on monado; the executable implements the wire protocol
-# itself so no monado libraries need to be linked.
+# Standalone build for monado-remote-client.
+# Builds against the monado submodule headers only; no monado libraries are linked.
 #
-# monado/build must exist (so the generated xrt_config_os.h is present).
-# Build monado once first: cmake -B monado/build monado && cmake --build monado/build
+# Prerequisite, run from ../monado:
+#   cmake -G Ninja -S . -B build
+#   cmake --build build
 #
-# Then from vibecoding-tests root:
-#   cmake -B build && cmake --build build
+# Build this project from remote-driver-client/:
+#   cmake -G Ninja -S . -B build
+#   cmake --build build
+
+cmake_minimum_required(VERSION 3.22)
+project(monado_remote_client C)
 
 set(MONADO ${CMAKE_CURRENT_SOURCE_DIR}/../monado)
+
+if(NOT EXISTS ${MONADO}/src/xrt/drivers/remote/r_interface.h)
+    message(FATAL_ERROR "Expected Monado sources at ${MONADO}")
+endif()
+
+if(NOT EXISTS ${MONADO}/build/src/xrt/include/xrt/xrt_config_build.h)
+    message(FATAL_ERROR
+        "Expected generated Monado headers in ${MONADO}/build. Build Monado first with: "
+        "cd ../monado && cmake -G Ninja -S . -B build && cmake --build build")
+endif()
 
 add_executable(monado-remote-client main.c)
 
@@ -19,7 +33,7 @@ set_property(TARGET monado-remote-client PROPERTY C_STANDARD_REQUIRED ON)
 target_include_directories(
     monado-remote-client PRIVATE
     ${MONADO}/src/xrt/include          # xrt/xrt_defines.h, xrt/xrt_compiler.h, ...
-    ${MONADO}/build/src/xrt/include    # generated: xrt/xrt_config_os.h, ...
+    ${MONADO}/build/src/xrt/include    # generated: xrt/xrt_config_build.h, ...
     ${MONADO}/src/xrt/auxiliary        # util/u_logging.h (pulled in by r_interface.h)
     ${MONADO}/src/xrt/drivers          # remote/r_interface.h
 )
