@@ -91,9 +91,34 @@ kill $MONADO_PID
 wait $MONADO_PID 2>/dev/null || true
 ```
 
+GUI automation smoke test for the Composition Layers tab:
+
+```sh
+P_OVERRIDE_ACTIVE_CONFIG=remote \
+XRT_COMPOSITOR_FORCE_XCB=1 \
+XRT_NO_STDIN=1 \
+stdbuf -oL -eL ../monado/build/src/xrt/targets/service/monado-service \
+    > /tmp/monado-debug-layer-gui.log 2>&1 &
+MONADO_PID=$!
+until grep -q "Listening on port '4242'" /tmp/monado-debug-layer-gui.log 2>/dev/null; do sleep 0.2; done
+
+sleep infinity | env \
+    XR_DEBUG_GUI_START_PANEL=layers \
+    XR_DEBUG_GUI_STDOUT_PANEL=layers \
+    XR_DEBUG_GUI_FPS=5 \
+    stdbuf -oL -eL \
+    build/xr-with-debug-gui.sh \
+    ../openxr-simple-playground/build/openxr-playground \
+    2>&1 | tee /tmp/openxr-playground-debug-gui.log
+
+kill $MONADO_PID
+wait $MONADO_PID 2>/dev/null || true
+```
+
 - Start Monado first using the repo-wide instructions in `../AGENTS.md`.
 - Prefer running this smoke test automatically after runtime-facing `debug_layer` changes, not just a compile-only check.
 - Success signals include `XR_SESSION_STATE_VISIBLE->XR_SESSION_STATE_FOCUSED` and `Captured Vulkan preview`.
+- The GUI automation smoke test should log `startup panel focus requested: "Composition Layers"` and repeated `[ui][Composition Layers] focused=1 ...` lines.
 - Failure signals include `VUID`, `Validation Error`, or `ERROR:`.
 - If this workflow breaks or needs extra setup to run cleanly, update this file or `../AGENTS.md` with the corrected commands before finishing.
 

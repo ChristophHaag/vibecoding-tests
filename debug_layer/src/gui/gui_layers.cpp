@@ -15,9 +15,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <iostream>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
+#include <strings.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -103,6 +105,20 @@ static float preview_avg_ms(double total_ms, uint64_t sample_count) {
   return sample_count == 0 ? 0.0f : (float)(total_ms / (double)sample_count);
 }
 
+static bool layers_stdout_logging_enabled() {
+  static bool enabled = [] {
+    const char *env = std::getenv("XR_DEBUG_GUI_STDOUT_PANEL");
+    if (env == nullptr || env[0] == '\0')
+      return false;
+
+    return strcasecmp(env, "layers") == 0 ||
+           strcasecmp(env, "composition") == 0 ||
+           strcasecmp(env, "composition-layers") == 0 ||
+           strcasecmp(env, "swapchain") == 0 || strcasecmp(env, "all") == 0;
+  }();
+  return enabled;
+}
+
 static const char *space_label(const InstanceData *data, XrSpace space,
                                char *fallback, size_t fallback_size) {
   if (space == XR_NULL_HANDLE)
@@ -116,7 +132,8 @@ static const char *space_label(const InstanceData *data, XrSpace space,
   return fallback;
 }
 
-static std::string sub_image_identity_key(const TrackedCompositionSubImage &sub) {
+static std::string
+sub_image_identity_key(const TrackedCompositionSubImage &sub) {
   std::ostringstream oss;
   oss << std::hex << (uint64_t)sub.swapchain << std::dec << ':'
       << sub.image_array_index << ':' << sub.offset_x << ':' << sub.offset_y
@@ -175,8 +192,9 @@ collect_display_layers(const std::deque<TrackedCompositionFrame> &frames) {
   return layers;
 }
 
-static const char *preview_note_for_swapchain(const InstanceData *data,
-                                              const TrackedSwapchain &swapchain) {
+static const char *
+preview_note_for_swapchain(const InstanceData *data,
+                           const TrackedSwapchain &swapchain) {
   if (!swapchain.preview_status.empty())
     return swapchain.preview_status.c_str();
 
@@ -191,7 +209,8 @@ static const char *preview_note_for_swapchain(const InstanceData *data,
     return "Preview capture is disabled for non-color swapchains.";
 
   if (swapchain.face_count != 1)
-    return "Preview capture does not yet support cube or multi-face swapchains.";
+    return "Preview capture does not yet support cube or multi-face "
+           "swapchains.";
 
   if (swapchain.array_size > 1)
     return "Preview currently shows array layer 0 only.";
@@ -199,10 +218,10 @@ static const char *preview_note_for_swapchain(const InstanceData *data,
   return "Waiting for the next throttled OpenGL preview capture.";
 }
 
-static void draw_sub_image_overlay(ImDrawList *draw_list, ImVec2 min,
-                                   ImVec2 canvas_size, int32_t full_width,
-                                   int32_t full_height,
-                                   const TrackedCompositionSubImage &sub_image) {
+static void
+draw_sub_image_overlay(ImDrawList *draw_list, ImVec2 min, ImVec2 canvas_size,
+                       int32_t full_width, int32_t full_height,
+                       const TrackedCompositionSubImage &sub_image) {
   float x0 =
       min.x + ((float)sub_image.offset_x / (float)full_width) * canvas_size.x;
   float y0 =
@@ -259,8 +278,7 @@ static void draw_image_rect_visualization(
 static void render_preview_inspector(
     const std::string &slot_key, const char *id,
     const TrackedPreviewImage *preview, const PreviewTextureKey *cache_key,
-    GLuint preview_texture,
-    int32_t full_width, int32_t full_height,
+    GLuint preview_texture, int32_t full_width, int32_t full_height,
     const TrackedCompositionSubImage &sub_image) {
   PreviewDisplayState &display = g_preview_display_state[slot_key];
   display.swapchain = (uint64_t)sub_image.swapchain;
@@ -273,20 +291,22 @@ static void render_preview_inspector(
 
   GLuint effective_texture = preview_texture;
   if (effective_texture == 0 && display.last_texture_key.swapchain != 0)
-    effective_texture = gui_lookup_cached_preview_texture(display.last_texture_key);
+    effective_texture =
+        gui_lookup_cached_preview_texture(display.last_texture_key);
 
-  uint32_t preview_width = preview != nullptr ? preview->width
-                                              : display.last_preview_width;
-  uint32_t preview_height = preview != nullptr ? preview->height
-                                               : display.last_preview_height;
-  bool has_preview_pixels = effective_texture != 0 && preview_width > 0 &&
-                            preview_height > 0;
+  uint32_t preview_width =
+      preview != nullptr ? preview->width : display.last_preview_width;
+  uint32_t preview_height =
+      preview != nullptr ? preview->height : display.last_preview_height;
+  bool has_preview_pixels =
+      effective_texture != 0 && preview_width > 0 && preview_height > 0;
 
   if (!display.inspect_mode) {
     ImGui::PushID(slot_key.c_str());
     draw_image_rect_visualization(id, full_width, full_height, sub_image,
                                   effective_texture);
-    if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+    if (ImGui::IsItemHovered() &&
+        ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
       display.inspect_mode = true;
       display.zoom = 1.0f;
     }
@@ -306,7 +326,8 @@ static void render_preview_inspector(
   ImGui::SameLine();
   if (ImGui::SmallButton("Reset"))
     display.zoom = 1.0f;
-  ImGui::TextDisabled("Mouse wheel zooms. Click the image to return to fit view.");
+  ImGui::TextDisabled(
+      "Mouse wheel zooms. Click the image to return to fit view.");
 
   ImVec2 image_size((float)preview_width * display.zoom,
                     (float)preview_height * display.zoom);
@@ -332,8 +353,8 @@ static void render_preview_inspector(
   if (has_preview_pixels && ImGui::IsItemHovered()) {
     float wheel = ImGui::GetIO().MouseWheel;
     if (wheel != 0.0f)
-      display.zoom = std::clamp(display.zoom * (wheel > 0.0f ? 1.2f : 1.0f / 1.2f),
-                                0.25f, 16.0f);
+      display.zoom = std::clamp(
+          display.zoom * (wheel > 0.0f ? 1.2f : 1.0f / 1.2f), 0.25f, 16.0f);
 
     if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
       display.inspect_mode = false;
@@ -401,7 +422,8 @@ static void render_sub_image(const InstanceData *data, const char *heading,
     PreviewTextureKey preview_texture_key = preview_lookup.texture_key;
     GLuint preview_texture = 0;
     if (has_matching_preview)
-      preview_texture = gui_ensure_preview_texture(preview_texture_key, *preview);
+      preview_texture =
+          gui_ensure_preview_texture(preview_texture_key, *preview);
 
     ImGui::Text("Swapchain extent: %ux%u", swapchain->width, swapchain->height);
     ImGui::Text("Format: %#llx  Samples: %u  Mips: %u",
@@ -416,22 +438,22 @@ static void render_sub_image(const InstanceData *data, const char *heading,
       ImGui::Text("Native image handle: %s", image_handle_buf);
     }
 
-    render_preview_inspector(preview_slot_key, "preview_rect", preview,
-                             has_matching_preview ? &preview_texture_key : nullptr,
-                             preview_texture, (int32_t)swapchain->width,
-                             (int32_t)swapchain->height, sub_image);
+    render_preview_inspector(
+        preview_slot_key, "preview_rect", preview,
+        has_matching_preview ? &preview_texture_key : nullptr, preview_texture,
+        (int32_t)swapchain->width, (int32_t)swapchain->height, sub_image);
 
     ImGui::TextDisabled("%s", has_matching_preview
-                                 ? "Click preview to inspect at actual pixels."
-                                 : "Preview unavailable for this sub-image.");
+                                  ? "Click preview to inspect at actual pixels."
+                                  : "Preview unavailable for this sub-image.");
 
     if (has_matching_preview) {
-      ImGui::Text("Preview: %ux%u  serial=%llu  array=%u",
-                  preview->width, preview->height,
-                  (unsigned long long)preview->capture_serial,
+      ImGui::Text("Preview: %ux%u  serial=%llu  array=%u", preview->width,
+                  preview->height, (unsigned long long)preview->capture_serial,
                   preview->image_array_index);
     } else {
-      ImGui::TextDisabled("Preview: %s", preview_note_for_swapchain(data, *swapchain));
+      ImGui::TextDisabled("Preview: %s",
+                          preview_note_for_swapchain(data, *swapchain));
     }
 
     ImGui::Text("Preview stats: submitted=%llu completed=%llu no-submit=%llu",
@@ -439,27 +461,27 @@ static void render_sub_image(const InstanceData *data, const char *heading,
                 (unsigned long long)swapchain->preview_success_count,
                 (unsigned long long)swapchain->preview_skip_count);
     ImGui::TextDisabled(
-      "No-submit means this release did not start a new preview capture."
-      " It includes unsupported, not-ready, throttled, or slot-busy cases.");
+        "No-submit means this release did not start a new preview capture."
+        " It includes unsupported, not-ready, throttled, or slot-busy cases.");
     ImGui::Text(
-      "Preview timing: app-thread %.3f / %.3f / %.3f ms (last/avg/max)",
-      swapchain->preview_app_thread_ms_last,
-      preview_avg_ms(swapchain->preview_app_thread_ms_total,
-               swapchain->preview_app_thread_sample_count),
-      swapchain->preview_app_thread_ms_max);
-    ImGui::Text(
-      "Preview finalize: %.3f / %.3f / %.3f ms   latency: %.3f / %.3f / %.3f ms",
-      swapchain->preview_finalize_ms_last,
-      preview_avg_ms(swapchain->preview_finalize_ms_total,
-               swapchain->preview_finalize_sample_count),
-      swapchain->preview_finalize_ms_max,
-      swapchain->preview_ready_latency_ms_last,
-      preview_avg_ms(swapchain->preview_ready_latency_ms_total,
-               swapchain->preview_ready_latency_sample_count),
-      swapchain->preview_ready_latency_ms_max);
+        "Preview timing: app-thread %.3f / %.3f / %.3f ms (last/avg/max)",
+        swapchain->preview_app_thread_ms_last,
+        preview_avg_ms(swapchain->preview_app_thread_ms_total,
+                       swapchain->preview_app_thread_sample_count),
+        swapchain->preview_app_thread_ms_max);
+    ImGui::Text("Preview finalize: %.3f / %.3f / %.3f ms   latency: %.3f / "
+                "%.3f / %.3f ms",
+                swapchain->preview_finalize_ms_last,
+                preview_avg_ms(swapchain->preview_finalize_ms_total,
+                               swapchain->preview_finalize_sample_count),
+                swapchain->preview_finalize_ms_max,
+                swapchain->preview_ready_latency_ms_last,
+                preview_avg_ms(swapchain->preview_ready_latency_ms_total,
+                               swapchain->preview_ready_latency_sample_count),
+                swapchain->preview_ready_latency_ms_max);
     ImGui::Text("Preview in-flight: %u current  %u peak",
-          swapchain->preview_inflight_count,
-          swapchain->preview_inflight_peak);
+                swapchain->preview_inflight_count,
+                swapchain->preview_inflight_peak);
   } else {
     ImGui::TextDisabled("Swapchain metadata not tracked yet");
   }
@@ -498,6 +520,8 @@ void gui_render_layers_panel(InstanceData *data) {
   }
 
   ImGui::Begin("Composition Layers");
+  bool panel_focused =
+      ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
   if (data->composition_frames.empty()) {
     ImGui::TextDisabled("Waiting for xrEndFrame submissions...");
@@ -518,6 +542,26 @@ void gui_render_layers_panel(InstanceData *data) {
               displayed_layers.size(),
               (unsigned long long)kCompositionLayerRetentionFrames);
 
+  if (layers_stdout_logging_enabled()) {
+    for (const auto &[swapchain_handle, swapchain] : data->swapchains) {
+      std::cout << "[XR_APILAYER_DEBUG_gui][ui][Composition Layers]"
+                << " focused=" << (panel_focused ? 1 : 0)
+                << " frame=" << (unsigned long long)frame.frame_number
+                << " displayed_layers=" << displayed_layers.size()
+                << " swapchain=0x" << std::hex
+                << (unsigned long long)swapchain_handle << std::dec
+                << " submitted="
+                << (unsigned long long)swapchain.preview_attempt_count
+                << " completed="
+                << (unsigned long long)swapchain.preview_success_count
+                << " no_submit="
+                << (unsigned long long)swapchain.preview_skip_count
+                << " inflight=" << swapchain.preview_inflight_count << "/"
+                << swapchain.preview_inflight_peak << " status=\""
+                << swapchain.preview_status << "\"" << std::endl;
+    }
+  }
+
   if (!data->sessions.empty()) {
     ImGui::SeparatorText("Session");
     for (const auto &[session_handle, session] : data->sessions) {
@@ -530,28 +574,28 @@ void gui_render_layers_panel(InstanceData *data) {
     }
   }
 
-    for (size_t layer_list_index = 0; layer_list_index < displayed_layers.size();
-      ++layer_list_index) {
-      const DisplayedLayer &displayed = displayed_layers[layer_list_index];
-      const TrackedCompositionLayer &layer = *displayed.layer;
+  for (size_t layer_list_index = 0; layer_list_index < displayed_layers.size();
+       ++layer_list_index) {
+    const DisplayedLayer &displayed = displayed_layers[layer_list_index];
+    const TrackedCompositionLayer &layer = *displayed.layer;
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen;
-      ImGui::PushID(displayed.identity_key.c_str());
-      if (ImGui::TreeNodeEx(
-        "layer", flags,
-        displayed.stale_frame_count == 0
-         ? "Layer %zu: %s"
-         : "Layer %zu: %s  [stale %llu frame%s]",
-        displayed.source_layer_index, layer_type_to_str(layer.type),
-        (unsigned long long)displayed.stale_frame_count,
-        displayed.stale_frame_count == 1 ? "" : "s")) {
+    ImGui::PushID(displayed.identity_key.c_str());
+    if (ImGui::TreeNodeEx("layer", flags,
+                          displayed.stale_frame_count == 0
+                              ? "Layer %zu: %s"
+                              : "Layer %zu: %s  [stale %llu frame%s]",
+                          displayed.source_layer_index,
+                          layer_type_to_str(layer.type),
+                          (unsigned long long)displayed.stale_frame_count,
+                          displayed.stale_frame_count == 1 ? "" : "s")) {
       char space_buf[32];
       ImGui::Text("Space: %s",
                   space_label(data, layer.space, space_buf, sizeof(space_buf)));
       ImGui::Text("Layer flags: %#llx", (unsigned long long)layer.layer_flags);
       ImGui::Text("Eye visibility: %s",
                   eye_visibility_to_str(layer.eye_visibility));
-     ImGui::Text("Last seen in frame: %llu",
-           (unsigned long long)displayed.source_frame_number);
+      ImGui::Text("Last seen in frame: %llu",
+                  (unsigned long long)displayed.source_frame_number);
 
       switch (layer.type) {
       case XR_TYPE_COMPOSITION_LAYER_PROJECTION:
@@ -566,8 +610,8 @@ void gui_render_layers_panel(InstanceData *data) {
                       view.fov.angleRight, view.fov.angleUp,
                       view.fov.angleDown);
           render_sub_image(data, "Color sub-image", view.sub_image,
-                           displayed.identity_key + ":view:" +
-                               std::to_string(view_index));
+                           displayed.identity_key +
+                               ":view:" + std::to_string(view_index));
         }
         break;
       case XR_TYPE_COMPOSITION_LAYER_QUAD:

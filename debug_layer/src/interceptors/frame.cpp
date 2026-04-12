@@ -46,7 +46,7 @@ static int64_t now_ns() {
 static float ns_to_ms(int64_t a, int64_t b) { return (float)((b - a) * 1e-6); }
 
 struct PreviewCaptureConfig {
-  int capture_interval = 2;
+  int capture_interval = 1;
   int max_edge = 320;
   int opengl_inflight_slots = 4;
   int vulkan_inflight_slots = 4;
@@ -80,14 +80,14 @@ static PreviewCaptureConfig get_preview_capture_config() {
   static PreviewCaptureConfig config = [] {
     PreviewCaptureConfig c;
     c.capture_interval = parse_env_int_with_legacy(
-        "XR_DEBUG_GUI_PREVIEW_INTERVAL", "XR_DEBUG_GUI_GL_PREVIEW_INTERVAL", 2,
+        "XR_DEBUG_GUI_PREVIEW_INTERVAL", "XR_DEBUG_GUI_GL_PREVIEW_INTERVAL", 1,
         0, 120);
     c.max_edge = parse_env_int_with_legacy("XR_DEBUG_GUI_PREVIEW_MAX_EDGE",
                                            "XR_DEBUG_GUI_GL_PREVIEW_MAX_EDGE",
                                            320, 32, 2048);
-    c.opengl_inflight_slots = parse_env_int_with_legacy(
-      "XR_DEBUG_GUI_PREVIEW_OPENGL_INFLIGHT",
-      "XR_DEBUG_GUI_GL_PREVIEW_INFLIGHT", 4, 1, 16);
+    c.opengl_inflight_slots =
+        parse_env_int_with_legacy("XR_DEBUG_GUI_PREVIEW_OPENGL_INFLIGHT",
+                                  "XR_DEBUG_GUI_GL_PREVIEW_INFLIGHT", 4, 1, 16);
     c.vulkan_inflight_slots =
         parse_env_int("XR_DEBUG_GUI_PREVIEW_VULKAN_INFLIGHT", 4, 1, 16);
     return c;
@@ -263,7 +263,7 @@ static std::unordered_map<XrSession, std::shared_ptr<VulkanPreviewSessionState>>
 
 static std::mutex g_opengl_preview_sessions_mutex;
 static std::unordered_map<XrSession, std::shared_ptr<OpenGLPreviewSessionState>>
-  g_opengl_preview_sessions;
+    g_opengl_preview_sessions;
 
 static struct {
   bool loaded = false;
@@ -320,7 +320,8 @@ static void *get_preview_gl_proc_address(const char *name) {
   void *proc = nullptr;
 
 #if defined(XR_USE_PLATFORM_EGL) || defined(__linux__)
-  using EglGetProcAddressProc = __eglMustCastToProperFunctionPointerType (*)(const char *);
+  using EglGetProcAddressProc =
+      __eglMustCastToProperFunctionPointerType (*)(const char *);
   static EglGetProcAddressProc egl_get_proc_address =
       reinterpret_cast<EglGetProcAddressProc>(
           load_egl_symbol("eglGetProcAddress"));
@@ -346,16 +347,16 @@ static bool load_preview_gl_functions() {
            preview_gl.FramebufferTextureLayer != nullptr &&
            preview_gl.DeleteFramebuffers != nullptr &&
            preview_gl.CheckFramebufferStatus != nullptr &&
-          preview_gl.BlitFramebuffer != nullptr &&
-          preview_gl.GenBuffers != nullptr &&
-          preview_gl.BindBuffer != nullptr &&
-          preview_gl.BufferData != nullptr &&
-          preview_gl.DeleteBuffers != nullptr &&
-          preview_gl.MapBufferRange != nullptr &&
-          preview_gl.UnmapBuffer != nullptr &&
-          preview_gl.FenceSync != nullptr &&
-          preview_gl.ClientWaitSync != nullptr &&
-          preview_gl.DeleteSync != nullptr;
+           preview_gl.BlitFramebuffer != nullptr &&
+           preview_gl.GenBuffers != nullptr &&
+           preview_gl.BindBuffer != nullptr &&
+           preview_gl.BufferData != nullptr &&
+           preview_gl.DeleteBuffers != nullptr &&
+           preview_gl.MapBufferRange != nullptr &&
+           preview_gl.UnmapBuffer != nullptr &&
+           preview_gl.FenceSync != nullptr &&
+           preview_gl.ClientWaitSync != nullptr &&
+           preview_gl.DeleteSync != nullptr;
   }
 
 #define LOAD(name)                                                             \
@@ -387,13 +388,11 @@ static bool load_preview_gl_functions() {
          preview_gl.DeleteFramebuffers != nullptr &&
          preview_gl.CheckFramebufferStatus != nullptr &&
          preview_gl.BlitFramebuffer != nullptr &&
-         preview_gl.GenBuffers != nullptr &&
-         preview_gl.BindBuffer != nullptr &&
+         preview_gl.GenBuffers != nullptr && preview_gl.BindBuffer != nullptr &&
          preview_gl.BufferData != nullptr &&
          preview_gl.DeleteBuffers != nullptr &&
          preview_gl.MapBufferRange != nullptr &&
-         preview_gl.UnmapBuffer != nullptr &&
-         preview_gl.FenceSync != nullptr &&
+         preview_gl.UnmapBuffer != nullptr && preview_gl.FenceSync != nullptr &&
          preview_gl.ClientWaitSync != nullptr &&
          preview_gl.DeleteSync != nullptr;
 }
@@ -419,8 +418,8 @@ get_opengl_preview_session_state(XrSession session, bool create_if_missing) {
   return state;
 }
 
-static void destroy_opengl_preview_slot_resources(
-    OpenGLPreviewCaptureSlot &slot) {
+static void
+destroy_opengl_preview_slot_resources(OpenGLPreviewCaptureSlot &slot) {
   if (slot.fence != nullptr)
     preview_gl.DeleteSync(slot.fence);
   if (slot.pbo != 0)
@@ -452,7 +451,8 @@ get_or_create_opengl_preview_context_state(OpenGLPreviewSessionState &state,
   if (!entry) {
     entry = std::make_unique<OpenGLPreviewContextState>();
     entry->context_key = context_key;
-    entry->slots.resize((size_t)get_preview_capture_config().opengl_inflight_slots);
+    entry->slots.resize(
+        (size_t)get_preview_capture_config().opengl_inflight_slots);
   }
   return entry.get();
 }
@@ -477,8 +477,9 @@ static void destroy_vulkan_preview_slot_submission_resources(
   slot.submit_end_ns = 0;
 }
 
-static void destroy_vulkan_preview_slot_target_resources(
-    VkDevice device, VulkanPreviewCaptureSlot &slot) {
+static void
+destroy_vulkan_preview_slot_target_resources(VkDevice device,
+                                             VulkanPreviewCaptureSlot &slot) {
   if (device == VK_NULL_HANDLE)
     return;
 
@@ -875,8 +876,8 @@ ensure_vulkan_preview_static_resources(VulkanPreviewSessionState &state,
 
 static bool ensure_vulkan_preview_target_resources(
     VulkanPreviewSessionState &state, VulkanPreviewCaptureSlot &slot,
-    uint32_t preview_width,
-    uint32_t preview_height, bool &recreated, std::string &status) {
+    uint32_t preview_width, uint32_t preview_height, bool &recreated,
+    std::string &status) {
   recreated = false;
   if (slot.destination_image != VK_NULL_HANDLE &&
       slot.destination_width == preview_width &&
@@ -1009,8 +1010,8 @@ static bool ensure_vulkan_preview_target_resources(
     destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
-  if (vkBindBufferMemory(device, slot.staging_buffer, slot.staging_memory,
-                         0) != VK_SUCCESS) {
+  if (vkBindBufferMemory(device, slot.staging_buffer, slot.staging_memory, 0) !=
+      VK_SUCCESS) {
     status = "Failed to bind Vulkan memory for the staging buffer";
     destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
@@ -1416,7 +1417,8 @@ static bool ensure_opengl_preview_slot_resources(OpenGLPreviewCaptureSlot &slot,
   }
 
   const size_t byte_size = (size_t)preview_width * (size_t)preview_height * 4;
-  if (slot.preview_width != preview_width || slot.preview_height != preview_height) {
+  if (slot.preview_width != preview_width ||
+      slot.preview_height != preview_height) {
     GLint prev_texture_2d = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_texture_2d);
     glBindTexture(GL_TEXTURE_2D, slot.dst_texture);
@@ -1482,9 +1484,9 @@ static void harvest_completed_opengl_preview_captures(XrSession session,
         result.status = "Failed to observe OpenGL preview completion fence";
       } else {
         preview_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, slot.pbo);
-        void *mapped =
-            preview_gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
-                                      (GLsizeiptr)slot.byte_size, GL_MAP_READ_BIT);
+        void *mapped = preview_gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
+                                                 (GLsizeiptr)slot.byte_size,
+                                                 GL_MAP_READ_BIT);
         if (mapped == nullptr) {
           result.status = "Failed to map the OpenGL preview PBO";
         } else {
@@ -1499,9 +1501,10 @@ static void harvest_completed_opengl_preview_captures(XrSession session,
           result.preview.image_array_index = slot.image_array_index;
           result.preview.width = slot.preview_width;
           result.preview.height = slot.preview_height;
-          result.status = slot.image_array_index != 0
-                              ? "Captured OpenGL preview asynchronously from array layer 0"
-                              : "Captured OpenGL preview asynchronously";
+          result.status =
+              slot.image_array_index != 0
+                  ? "Captured OpenGL preview asynchronously from array layer 0"
+                  : "Captured OpenGL preview asynchronously";
         }
       }
 
@@ -1543,8 +1546,8 @@ static void harvest_completed_opengl_preview_captures(XrSession session,
 
     if (result.preview.available) {
       tracked.latest_preview = result.preview;
-      tracked.preview_images[make_preview_key(result.preview.image_index,
-                                             result.preview.image_array_index)] =
+      tracked.preview_images[make_preview_key(
+          result.preview.image_index, result.preview.image_array_index)] =
           result.preview;
       tracked.preview_success_count++;
     }
@@ -1665,10 +1668,9 @@ submit_opengl_preview_capture(const PreviewCaptureRequest &request) {
                                       (GLuint)request.image_handle_value, 0);
       break;
     case PreviewAttachmentKind::Texture2DArrayLayer0:
-      preview_gl.FramebufferTextureLayer(GL_READ_FRAMEBUFFER,
-                                         GL_COLOR_ATTACHMENT0,
-                                         (GLuint)request.image_handle_value, 0,
-                                         0);
+      preview_gl.FramebufferTextureLayer(
+          GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+          (GLuint)request.image_handle_value, 0, 0);
       break;
     case PreviewAttachmentKind::Unsupported:
       result.status = "OpenGL preview attachment kind is unsupported";
@@ -1698,16 +1700,16 @@ submit_opengl_preview_capture(const PreviewCaptureRequest &request) {
 
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
-    preview_gl.BlitFramebuffer(0, 0, (GLint)request.width, (GLint)request.height,
-                               0, 0, (GLint)preview_width,
-                               (GLint)preview_height, GL_COLOR_BUFFER_BIT,
-                               GL_LINEAR);
+    preview_gl.BlitFramebuffer(0, 0, (GLint)request.width,
+                               (GLint)request.height, 0, 0,
+                               (GLint)preview_width, (GLint)preview_height,
+                               GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
     preview_gl.BindFramebuffer(GL_READ_FRAMEBUFFER, slot->dst_fbo);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, (GLsizei)preview_width, (GLsizei)preview_height,
-                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glReadPixels(0, 0, (GLsizei)preview_width, (GLsizei)preview_height, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
     slot->fence = preview_gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     if (slot->fence == nullptr) {
       result.status = "Failed to create the OpenGL preview fence";
@@ -1753,10 +1755,10 @@ static void harvest_completed_vulkan_preview_captures(XrSession session,
       if (!slot.in_flight || slot.fence == VK_NULL_HANDLE)
         continue;
 
-      VkResult fence_result = wait_for_all
-                                  ? vkWaitForFences(device, 1, &slot.fence,
-                                                    VK_TRUE, UINT64_MAX)
-                                  : vkGetFenceStatus(device, slot.fence);
+      VkResult fence_result =
+          wait_for_all
+              ? vkWaitForFences(device, 1, &slot.fence, VK_TRUE, UINT64_MAX)
+              : vkGetFenceStatus(device, slot.fence);
       if (!wait_for_all && fence_result == VK_NOT_READY)
         continue;
 
@@ -1823,8 +1825,8 @@ static void harvest_completed_vulkan_preview_captures(XrSession session,
 
     if (result.preview.available) {
       tracked.latest_preview = result.preview;
-      tracked.preview_images[make_preview_key(result.preview.image_index,
-                                             result.preview.image_array_index)] =
+      tracked.preview_images[make_preview_key(
+          result.preview.image_index, result.preview.image_array_index)] =
           result.preview;
       tracked.preview_success_count++;
     }
@@ -1914,7 +1916,8 @@ submit_vulkan_preview_capture(const PreviewCaptureRequest &request) {
   source_image_view_info.image = source_image;
   source_image_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
   source_image_view_info.format = (VkFormat)request.format;
-  source_image_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  source_image_view_info.subresourceRange.aspectMask =
+      VK_IMAGE_ASPECT_COLOR_BIT;
   source_image_view_info.subresourceRange.baseMipLevel = 0;
   source_image_view_info.subresourceRange.levelCount = 1;
   source_image_view_info.subresourceRange.baseArrayLayer = 0;
@@ -2026,8 +2029,7 @@ submit_vulkan_preview_capture(const PreviewCaptureRequest &request) {
 
   vkCmdBindPipeline(slot->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     state->pipeline);
-  vkCmdBindDescriptorSets(slot->command_buffer,
-                          VK_PIPELINE_BIND_POINT_GRAPHICS,
+  vkCmdBindDescriptorSets(slot->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           state->pipeline_layout, 0, 1, &slot->descriptor_set,
                           0, nullptr);
   vkCmdDraw(slot->command_buffer, 3, 1, 0, 0);
@@ -2098,8 +2100,7 @@ submit_vulkan_preview_capture(const PreviewCaptureRequest &request) {
   VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   submit_info.commandBufferCount = 1;
   submit_info.pCommandBuffers = &slot->command_buffer;
-  if (vkQueueSubmit(state->queue, 1, &submit_info, slot->fence) !=
-      VK_SUCCESS) {
+  if (vkQueueSubmit(state->queue, 1, &submit_info, slot->fence) != VK_SUCCESS) {
     result.status = "Failed to submit the Vulkan preview commands";
     destroy_vulkan_preview_slot_submission_resources(device, *slot);
     return result;
@@ -2502,7 +2503,8 @@ XrResult XRAPI_CALL Layer_xrEnumerateSwapchainImages(
 
   XrResult result = data->next.xrEnumerateSwapchainImages(
       swapchain, imageCapacityInput, imageCountOutput, images);
-  if (XR_SUCCEEDED(result) && images != nullptr && imageCountOutput != nullptr) {
+  if (XR_SUCCEEDED(result) && images != nullptr &&
+      imageCountOutput != nullptr) {
     std::unique_lock lock(data->state_mutex);
     auto it = data->swapchains.find(swapchain);
     if (it != data->swapchains.end()) {
@@ -2713,17 +2715,16 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
         if (has_captured_preview)
           tracked.preview_success_count++;
         if (preview_app_thread_ms > 0.0f) {
-          record_preview_timing(
-              preview_app_thread_ms, tracked.preview_app_thread_ms_last,
-              tracked.preview_app_thread_ms_max,
-              tracked.preview_app_thread_ms_total,
-              tracked.preview_app_thread_sample_count);
+          record_preview_timing(preview_app_thread_ms,
+                                tracked.preview_app_thread_ms_last,
+                                tracked.preview_app_thread_ms_max,
+                                tracked.preview_app_thread_ms_total,
+                                tracked.preview_app_thread_sample_count);
         }
         if (submitted_async_preview) {
           tracked.preview_inflight_count++;
-          tracked.preview_inflight_peak =
-              std::max(tracked.preview_inflight_peak,
-                       tracked.preview_inflight_count);
+          tracked.preview_inflight_peak = std::max(
+              tracked.preview_inflight_peak, tracked.preview_inflight_count);
         }
       } else {
         tracked.preview_skip_count++;
@@ -2758,9 +2759,9 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
         oss << "[XR_APILAYER_DEBUG_gui][preview] swapchain=0x" << std::hex
             << (uint64_t)swapchain << std::dec << " session=0x" << std::hex
             << (uint64_t)tracked.session << std::dec
-          << " submitted=" << tracked.preview_attempt_count
-          << " completed=" << tracked.preview_success_count
-          << " no_submit=" << tracked.preview_skip_count
+            << " submitted=" << tracked.preview_attempt_count
+            << " completed=" << tracked.preview_success_count
+            << " no_submit=" << tracked.preview_skip_count
             << " inflight=" << tracked.preview_inflight_count << "/"
             << tracked.preview_inflight_peak
             << " app_ms=" << tracked.preview_app_thread_ms_last

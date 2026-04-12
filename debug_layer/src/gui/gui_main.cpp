@@ -27,6 +27,37 @@
 
 namespace debug_layer {
 
+static const char *panel_token_to_window_name(const char *token) {
+  if (token == nullptr || token[0] == '\0')
+    return nullptr;
+
+  if (SDL_strcasecmp(token, "layers") == 0 ||
+      SDL_strcasecmp(token, "composition") == 0 ||
+      SDL_strcasecmp(token, "composition-layers") == 0 ||
+      SDL_strcasecmp(token, "swapchain") == 0)
+    return "Composition Layers";
+  if (SDL_strcasecmp(token, "spaces") == 0 ||
+      SDL_strcasecmp(token, "3d") == 0 ||
+      SDL_strcasecmp(token, "3d-spaces") == 0)
+    return "3D Spaces";
+  if (SDL_strcasecmp(token, "perf") == 0 ||
+      SDL_strcasecmp(token, "performance") == 0)
+    return "Performance";
+  if (SDL_strcasecmp(token, "frame") == 0 ||
+      SDL_strcasecmp(token, "frame-info") == 0)
+    return "Frame Info";
+  if (SDL_strcasecmp(token, "profiles") == 0 ||
+      SDL_strcasecmp(token, "live-state") == 0)
+    return "Active Profiles & Live State";
+  if (SDL_strcasecmp(token, "actions") == 0 ||
+      SDL_strcasecmp(token, "action-sets") == 0)
+    return "Action Sets & Actions";
+  if (SDL_strcasecmp(token, "bindings") == 0 ||
+      SDL_strcasecmp(token, "suggested-bindings") == 0)
+    return "Suggested Bindings";
+  return nullptr;
+}
+
 // Strip "XR_SESSION_STATE_" prefix (17 chars) from the enum name.
 static const char *session_state_to_str(XrSessionState s) {
 #define CASE(name, val)                                                        \
@@ -46,6 +77,15 @@ static void gui_render_thread_func(InstanceData *data) {
       target_fps = v;
   }
   auto frame_duration = std::chrono::milliseconds(1000 / target_fps);
+
+  const char *start_panel_window_name =
+      panel_token_to_window_name(std::getenv("XR_DEBUG_GUI_START_PANEL"));
+  int startup_focus_frames_remaining =
+      start_panel_window_name != nullptr ? 60 : 0;
+  if (start_panel_window_name != nullptr) {
+    std::cout << "[XR_APILAYER_DEBUG_gui][ui] startup panel focus requested: \""
+              << start_panel_window_name << "\"" << std::endl;
+  }
 
   // ── Initialize SDL entirely on this thread ───────────────────────────
   // We MUST NOT init SDL or create GL contexts on the app's thread, because
@@ -207,14 +247,30 @@ static void gui_render_thread_func(InstanceData *data) {
     }
 
     // ── Render panels ────────────────────────────────────────────
+    bool request_start_panel_focus = start_panel_window_name != nullptr &&
+                                     startup_focus_frames_remaining > 0;
+
+    if (request_start_panel_focus &&
+        std::strcmp(start_panel_window_name, "Action Sets & Actions") == 0)
+      ImGui::SetNextWindowFocus();
     gui_render_actions_panel(data);
 
+    if (request_start_panel_focus &&
+        std::strcmp(start_panel_window_name, "Composition Layers") == 0)
+      ImGui::SetNextWindowFocus();
     ImGuiWindow *layers_window = ImGui::FindWindowByName("Composition Layers");
     if (layers_window == nullptr || layers_window->DockId == 0)
       ImGui::SetNextWindowDockID(info_dock_id, ImGuiCond_Appearing);
     gui_render_layers_panel(data);
 
+    if (request_start_panel_focus &&
+        std::strcmp(start_panel_window_name, "3D Spaces") == 0)
+      ImGui::SetNextWindowFocus();
     gui_render_spaces_panel(data);
+
+    if (request_start_panel_focus &&
+        std::strcmp(start_panel_window_name, "Performance") == 0)
+      ImGui::SetNextWindowFocus();
     gui_render_perf_panel(data);
 
     // ── Render frame info panel ───────────────────────────────────
@@ -224,6 +280,10 @@ static void gui_render_thread_func(InstanceData *data) {
       static std::vector<float> plot_buf;
 
       std::shared_lock lock(data->state_mutex);
+
+      if (request_start_panel_focus &&
+          std::strcmp(start_panel_window_name, "Frame Info") == 0)
+        ImGui::SetNextWindowFocus();
       ImGui::Begin("Frame Info");
 
       // Frame counter
@@ -299,6 +359,9 @@ static void gui_render_thread_func(InstanceData *data) {
 
       ImGui::End();
     }
+
+    if (startup_focus_frames_remaining > 0)
+      startup_focus_frames_remaining--;
 
     // Finalize
     ImGui::Render();

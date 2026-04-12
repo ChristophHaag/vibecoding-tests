@@ -78,7 +78,9 @@ my_xr_app
 |---|---|
 | `XR_DEBUG_GUI_DISABLE=1` | Load layer but skip GUI window (interceptors still log to stderr) |
 | `XR_DEBUG_GUI_FPS=N` | GUI render rate, 1–240 (default: 30) |
-| `XR_DEBUG_GUI_PREVIEW_INTERVAL=N` | Capture every `N`th eligible previewable swapchain release; `0` disables preview capture |
+| `XR_DEBUG_GUI_START_PANEL=name` | Bring a specific docked panel tab to the front during startup. Supported names include `layers`, `spaces`, `perf`, `frame`, `profiles`, `actions`, and `bindings`. |
+| `XR_DEBUG_GUI_STDOUT_PANEL=name` | Emit a per-GUI-frame summary of a panel to stdout for automation. Currently supports `layers` or `all`. |
+| `XR_DEBUG_GUI_PREVIEW_INTERVAL=N` | Capture every `N`th eligible previewable swapchain release; `0` disables preview capture. Default: `1`. |
 | `XR_DEBUG_GUI_PREVIEW_MAX_EDGE=N` | Maximum thumbnail edge length before downscaling (default: 320) |
 | `XR_DEBUG_GUI_PREVIEW_OPENGL_INFLIGHT=N` | Number of OpenGL preview capture slots kept in flight before new submits are skipped (default: 4) |
 | `XR_DEBUG_GUI_PREVIEW_VULKAN_INFLIGHT=N` | Number of Vulkan preview capture slots kept in flight before new submits are skipped (default: 4) |
@@ -110,6 +112,23 @@ Legacy `XR_DEBUG_GUI_GL_PREVIEW_*` variable names are still accepted for compati
 - Use the Performance panel to compare `xrReleaseSwapchainImage`, swapchain, app-work, and `xrEndFrame` timing with preview capture disabled vs. `XR_DEBUG_GUI_PREVIEW_INTERVAL=1`.
 - For OpenGL, the key steady-state numbers are preview app-thread time and skipped submissions. If the app-thread time is low but skips rise, increase `XR_DEBUG_GUI_PREVIEW_OPENGL_INFLIGHT` before assuming the path itself is too expensive.
 - For Vulkan, the key steady-state number is preview app-thread time. In a healthy async path it should stay well below the deferred finalize and ready-latency numbers.
+
+## GUI Automation
+
+- Use `XR_DEBUG_GUI_START_PANEL=layers` to make the Composition Layers tab frontmost on startup even when the existing `imgui.ini` layout would otherwise reopen a different tab.
+- Use `XR_DEBUG_GUI_STDOUT_PANEL=layers` together with a lower `XR_DEBUG_GUI_FPS` to log the live Composition Layers panel summary to stdout for automation.
+- A practical real-world command is:
+
+```sh
+sleep infinity | env \
+  XR_DEBUG_GUI_START_PANEL=layers \
+  XR_DEBUG_GUI_STDOUT_PANEL=layers \
+  XR_DEBUG_GUI_FPS=10 \
+  stdbuf -oL -eL \
+  build/xr-with-debug-gui.sh \
+  /home/haagch-demo/projects/vibecoding-tests/openxr-simple-playground/build/openxr-playground \
+  2>&1 | tee /tmp/openxr-playground-debug-gui.log
+```
 
 ## Vulkan Validation Smoke Test
 
