@@ -118,15 +118,17 @@ else()
     )
 endif()
 
-# ── Copy manifest next to library ─────────────────────────────────────────────
+# ── Generate manifest into a dedicated loader directory ──────────────────────
+set(LAYER_MANIFEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/openxr-api-layer")
+set(LAYER_LIBRARY_PATH "../libXrApiLayer_debug_gui.so")
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/XrApiLayer_debug_gui.json
-    ${CMAKE_CURRENT_BINARY_DIR}/XrApiLayer_debug_gui.json
-    COPYONLY
+    ${LAYER_MANIFEST_DIR}/XrApiLayer_debug_gui.json
+    @ONLY
 )
 
 # ── Generate wrapper script with baked-in paths ───────────────────────────────
-set(LAYER_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+set(LAYER_BUILD_DIR "${LAYER_MANIFEST_DIR}")
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/xr-with-debug-gui.sh.in
     ${CMAKE_CURRENT_BINARY_DIR}/xr-with-debug-gui.sh

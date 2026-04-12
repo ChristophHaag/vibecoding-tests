@@ -46,7 +46,7 @@ SDL3, Dear ImGui, and OpenXR headers are fetched automatically via FetchContent.
 
 Output:
 - `build/libXrApiLayer_debug_gui.so`
-- `build/XrApiLayer_debug_gui.json`
+- `build/openxr-api-layer/XrApiLayer_debug_gui.json`
 - `build/xr-with-debug-gui.sh`
 
 ## Usage
@@ -68,7 +68,7 @@ The script is callable from any directory — it has the build path baked in.
 
 ```sh
 export XR_ENABLE_API_LAYERS=XR_APILAYER_DEBUG_gui
-export XR_API_LAYER_PATH=/path/to/debug_layer/build
+export XR_API_LAYER_PATH=/path/to/debug_layer/build/openxr-api-layer
 my_xr_app
 ```
 
@@ -80,6 +80,7 @@ my_xr_app
 | `XR_DEBUG_GUI_FPS=N` | GUI render rate, 1–240 (default: 30) |
 | `XR_DEBUG_GUI_PREVIEW_INTERVAL=N` | Capture every `N`th eligible previewable swapchain release; `0` disables preview capture |
 | `XR_DEBUG_GUI_PREVIEW_MAX_EDGE=N` | Maximum thumbnail edge length before downscaling (default: 320) |
+| `XR_DEBUG_GUI_PREVIEW_OPENGL_INFLIGHT=N` | Number of OpenGL preview capture slots kept in flight before new submits are skipped (default: 4) |
 | `XR_DEBUG_GUI_PREVIEW_VULKAN_INFLIGHT=N` | Number of Vulkan preview capture slots kept in flight before new submits are skipped (default: 4) |
 | `XR_DEBUG_GUI_PREVIEW_LOG=1` | Log first successful preview capture and distinct preview skip/failure reasons per swapchain |
 | `XR_DEBUG_GUI_PREVIEW_LOG=2` | Log every preview attempt and skip; useful only for short debugging runs |
@@ -89,9 +90,9 @@ Legacy `XR_DEBUG_GUI_GL_PREVIEW_*` variable names are still accepted for compati
 ## Composition Layer Preview Design
 
 - The layer deep-copies `xrEndFrame` layer submissions into tracked state so the GUI never depends on application-owned pointers after the call returns.
-- OpenGL preview capture runs on the application thread before `xrReleaseSwapchainImage`, where the image is still owned by the app and safe to read with the app's current context.
+- OpenGL preview capture now performs only the source-image blit and PBO readback submission on the application thread before `xrReleaseSwapchainImage`. Fence polling, PBO mapping, and CPU-side thumbnail copies are harvested asynchronously on later releases.
 - Vulkan preview capture still records work on the application thread before `xrReleaseSwapchainImage`, but the steady-state path now only submits GPU work there. Fence polling, staging invalidation, and CPU-side thumbnail copies are harvested asynchronously on later releases.
-- The preview path uses direct GL proc lookup (`eglGetProcAddress` / `glXGetProcAddressARB`) instead of SDL, because the app thread is not required to initialize SDL.
+- The preview path resolves GL helper entry points directly from EGL or GLX instead of SDL, because the app thread is not required to initialize SDL.
 - Captured previews are cached per `(swapchain, image index, array index)` instead of only keeping the newest preview for a swapchain. This avoids flicker when apps rotate through swapchain images.
 - The Composition Layers panel renders a short retained live set of recent layers instead of only the last frame. Layers missing for a few frames are marked stale before being dropped.
 - The Composition Layers panel now shows preview app-thread time, async finalize time, ready latency, and in-flight depth so capture overhead can be compared directly against the frame timing graphs.
@@ -107,6 +108,7 @@ Legacy `XR_DEBUG_GUI_GL_PREVIEW_*` variable names are still accepted for compati
 
 - Use the Composition Layers panel to compare preview `attempts`, `success`, `skipped`, app-thread time, finalize time, and ready latency for a live swapchain.
 - Use the Performance panel to compare `xrReleaseSwapchainImage`, swapchain, app-work, and `xrEndFrame` timing with preview capture disabled vs. `XR_DEBUG_GUI_PREVIEW_INTERVAL=1`.
+- For OpenGL, the key steady-state numbers are preview app-thread time and skipped submissions. If the app-thread time is low but skips rise, increase `XR_DEBUG_GUI_PREVIEW_OPENGL_INFLIGHT` before assuming the path itself is too expensive.
 - For Vulkan, the key steady-state number is preview app-thread time. In a healthy async path it should stay well below the deferred finalize and ready-latency numbers.
 
 ## Vulkan Validation Smoke Test

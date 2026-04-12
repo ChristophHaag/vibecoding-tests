@@ -22,6 +22,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -45,6 +48,7 @@ static float ns_to_ms(int64_t a, int64_t b) { return (float)((b - a) * 1e-6); }
 struct PreviewCaptureConfig {
   int capture_interval = 2;
   int max_edge = 320;
+  int opengl_inflight_slots = 4;
   int vulkan_inflight_slots = 4;
 };
 
@@ -81,6 +85,9 @@ static PreviewCaptureConfig get_preview_capture_config() {
     c.max_edge = parse_env_int_with_legacy("XR_DEBUG_GUI_PREVIEW_MAX_EDGE",
                                            "XR_DEBUG_GUI_GL_PREVIEW_MAX_EDGE",
                                            320, 32, 2048);
+    c.opengl_inflight_slots = parse_env_int_with_legacy(
+      "XR_DEBUG_GUI_PREVIEW_OPENGL_INFLIGHT",
+      "XR_DEBUG_GUI_GL_PREVIEW_INFLIGHT", 4, 1, 16);
     c.vulkan_inflight_slots =
         parse_env_int("XR_DEBUG_GUI_PREVIEW_VULKAN_INFLIGHT", 4, 1, 16);
     return c;
@@ -190,6 +197,49 @@ struct VulkanPreviewHarvestResult {
   float ready_latency_ms = 0.0f;
 };
 
+struct OpenGLPreviewCaptureSlot {
+  GLuint src_fbo = 0;
+  GLuint dst_fbo = 0;
+  GLuint dst_texture = 0;
+  GLuint pbo = 0;
+  GLsync fence = nullptr;
+  bool in_flight = false;
+  uint32_t preview_width = 0;
+  uint32_t preview_height = 0;
+  size_t byte_size = 0;
+  XrSwapchain swapchain = XR_NULL_HANDLE;
+  uint32_t image_index = 0;
+  uint32_t image_array_index = 0;
+  uint64_t capture_serial = 0;
+  int64_t submit_begin_ns = 0;
+  int64_t submit_end_ns = 0;
+};
+
+struct OpenGLPreviewContextState {
+  uint64_t context_key = 0;
+  std::vector<OpenGLPreviewCaptureSlot> slots;
+};
+
+struct OpenGLPreviewSessionState {
+  std::mutex mutex;
+  std::unordered_map<uint64_t, std::unique_ptr<OpenGLPreviewContextState>>
+      contexts;
+};
+
+struct OpenGLPreviewSubmitResult {
+  bool submitted = false;
+  float app_thread_ms = 0.0f;
+  std::string status;
+};
+
+struct OpenGLPreviewHarvestResult {
+  XrSwapchain swapchain = XR_NULL_HANDLE;
+  TrackedPreviewImage preview;
+  std::string status;
+  float finalize_ms = 0.0f;
+  float ready_latency_ms = 0.0f;
+};
+
 struct VulkanPreviewSessionState {
   std::mutex mutex;
   VulkanPreviewSessionBinding binding;
@@ -211,6 +261,10 @@ static std::mutex g_vulkan_preview_sessions_mutex;
 static std::unordered_map<XrSession, std::shared_ptr<VulkanPreviewSessionState>>
     g_vulkan_preview_sessions;
 
+static std::mutex g_opengl_preview_sessions_mutex;
+static std::unordered_map<XrSession, std::shared_ptr<OpenGLPreviewSessionState>>
+  g_opengl_preview_sessions;
+
 static struct {
   bool loaded = false;
   PFNGLGENFRAMEBUFFERSPROC GenFramebuffers = nullptr;
@@ -220,15 +274,61 @@ static struct {
   PFNGLDELETEFRAMEBUFFERSPROC DeleteFramebuffers = nullptr;
   PFNGLCHECKFRAMEBUFFERSTATUSPROC CheckFramebufferStatus = nullptr;
   PFNGLBLITFRAMEBUFFERPROC BlitFramebuffer = nullptr;
+  PFNGLGENBUFFERSPROC GenBuffers = nullptr;
+  PFNGLBINDBUFFERPROC BindBuffer = nullptr;
+  PFNGLBUFFERDATAPROC BufferData = nullptr;
+  PFNGLDELETEBUFFERSPROC DeleteBuffers = nullptr;
+  PFNGLMAPBUFFERRANGEPROC MapBufferRange = nullptr;
+  PFNGLUNMAPBUFFERPROC UnmapBuffer = nullptr;
+  PFNGLFENCESYNCPROC FenceSync = nullptr;
+  PFNGLCLIENTWAITSYNCPROC ClientWaitSync = nullptr;
+  PFNGLDELETESYNCPROC DeleteSync = nullptr;
 } preview_gl;
+
+#if defined(__linux__)
+static void *load_egl_symbol(const char *name) {
+  static void *egl_handle = []() -> void * {
+    void *handle = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (handle == nullptr)
+      handle = dlopen("libEGL.so", RTLD_LAZY | RTLD_LOCAL);
+    return handle;
+  }();
+  return egl_handle != nullptr ? dlsym(egl_handle, name) : nullptr;
+}
+#endif
+
+static uint64_t current_gl_context_key() {
+#if defined(__linux__)
+  using EglGetCurrentContextProc = EGLContext (*)(void);
+  static EglGetCurrentContextProc egl_get_current_context =
+      reinterpret_cast<EglGetCurrentContextProc>(
+          load_egl_symbol("eglGetCurrentContext"));
+  if (egl_get_current_context != nullptr) {
+    EGLContext egl_context = egl_get_current_context();
+    if (egl_context != EGL_NO_CONTEXT)
+      return pack_handle(egl_context);
+  }
+
+  GLXContext glx_context = glXGetCurrentContext();
+  if (glx_context != nullptr)
+    return pack_handle(glx_context);
+#endif
+  return 0;
+}
 
 static void *get_preview_gl_proc_address(const char *name) {
   void *proc = nullptr;
 
 #if defined(XR_USE_PLATFORM_EGL) || defined(__linux__)
-  proc = (void *)eglGetProcAddress(name);
-  if (proc != nullptr)
-    return proc;
+  using EglGetProcAddressProc = __eglMustCastToProperFunctionPointerType (*)(const char *);
+  static EglGetProcAddressProc egl_get_proc_address =
+      reinterpret_cast<EglGetProcAddressProc>(
+          load_egl_symbol("eglGetProcAddress"));
+  if (egl_get_proc_address != nullptr) {
+    proc = reinterpret_cast<void *>(egl_get_proc_address(name));
+    if (proc != nullptr)
+      return proc;
+  }
 #endif
 
 #if defined(__linux__)
@@ -246,7 +346,16 @@ static bool load_preview_gl_functions() {
            preview_gl.FramebufferTextureLayer != nullptr &&
            preview_gl.DeleteFramebuffers != nullptr &&
            preview_gl.CheckFramebufferStatus != nullptr &&
-           preview_gl.BlitFramebuffer != nullptr;
+          preview_gl.BlitFramebuffer != nullptr &&
+          preview_gl.GenBuffers != nullptr &&
+          preview_gl.BindBuffer != nullptr &&
+          preview_gl.BufferData != nullptr &&
+          preview_gl.DeleteBuffers != nullptr &&
+          preview_gl.MapBufferRange != nullptr &&
+          preview_gl.UnmapBuffer != nullptr &&
+          preview_gl.FenceSync != nullptr &&
+          preview_gl.ClientWaitSync != nullptr &&
+          preview_gl.DeleteSync != nullptr;
   }
 
 #define LOAD(name)                                                             \
@@ -259,6 +368,15 @@ static bool load_preview_gl_functions() {
   LOAD(DeleteFramebuffers);
   LOAD(CheckFramebufferStatus);
   LOAD(BlitFramebuffer);
+  LOAD(GenBuffers);
+  LOAD(BindBuffer);
+  LOAD(BufferData);
+  LOAD(DeleteBuffers);
+  LOAD(MapBufferRange);
+  LOAD(UnmapBuffer);
+  LOAD(FenceSync);
+  LOAD(ClientWaitSync);
+  LOAD(DeleteSync);
 #undef LOAD
 
   preview_gl.loaded = true;
@@ -268,7 +386,16 @@ static bool load_preview_gl_functions() {
          preview_gl.FramebufferTextureLayer != nullptr &&
          preview_gl.DeleteFramebuffers != nullptr &&
          preview_gl.CheckFramebufferStatus != nullptr &&
-         preview_gl.BlitFramebuffer != nullptr;
+         preview_gl.BlitFramebuffer != nullptr &&
+         preview_gl.GenBuffers != nullptr &&
+         preview_gl.BindBuffer != nullptr &&
+         preview_gl.BufferData != nullptr &&
+         preview_gl.DeleteBuffers != nullptr &&
+         preview_gl.MapBufferRange != nullptr &&
+         preview_gl.UnmapBuffer != nullptr &&
+         preview_gl.FenceSync != nullptr &&
+         preview_gl.ClientWaitSync != nullptr &&
+         preview_gl.DeleteSync != nullptr;
 }
 
 static std::shared_ptr<VulkanPreviewSessionState>
@@ -276,6 +403,58 @@ get_vulkan_preview_session_state(XrSession session) {
   std::lock_guard lock(g_vulkan_preview_sessions_mutex);
   auto it = g_vulkan_preview_sessions.find(session);
   return it != g_vulkan_preview_sessions.end() ? it->second : nullptr;
+}
+
+static std::shared_ptr<OpenGLPreviewSessionState>
+get_opengl_preview_session_state(XrSession session, bool create_if_missing) {
+  std::lock_guard lock(g_opengl_preview_sessions_mutex);
+  auto it = g_opengl_preview_sessions.find(session);
+  if (it != g_opengl_preview_sessions.end())
+    return it->second;
+  if (!create_if_missing)
+    return nullptr;
+
+  auto state = std::make_shared<OpenGLPreviewSessionState>();
+  g_opengl_preview_sessions[session] = state;
+  return state;
+}
+
+static void destroy_opengl_preview_slot_resources(
+    OpenGLPreviewCaptureSlot &slot) {
+  if (slot.fence != nullptr)
+    preview_gl.DeleteSync(slot.fence);
+  if (slot.pbo != 0)
+    preview_gl.DeleteBuffers(1, &slot.pbo);
+  if (slot.dst_fbo != 0)
+    preview_gl.DeleteFramebuffers(1, &slot.dst_fbo);
+  if (slot.src_fbo != 0)
+    preview_gl.DeleteFramebuffers(1, &slot.src_fbo);
+  if (slot.dst_texture != 0)
+    glDeleteTextures(1, &slot.dst_texture);
+
+  slot = OpenGLPreviewCaptureSlot{};
+}
+
+static void destroy_opengl_preview_context_resources(
+    OpenGLPreviewContextState &context_state) {
+  for (auto &slot : context_state.slots)
+    destroy_opengl_preview_slot_resources(slot);
+  context_state.slots.clear();
+}
+
+static OpenGLPreviewContextState *
+get_or_create_opengl_preview_context_state(OpenGLPreviewSessionState &state,
+                                           uint64_t context_key) {
+  if (context_key == 0)
+    return nullptr;
+
+  auto &entry = state.contexts[context_key];
+  if (!entry) {
+    entry = std::make_unique<OpenGLPreviewContextState>();
+    entry->context_key = context_key;
+    entry->slots.resize((size_t)get_preview_capture_config().opengl_inflight_slots);
+  }
+  return entry.get();
 }
 
 static void destroy_vulkan_preview_slot_submission_resources(
@@ -902,14 +1081,41 @@ void destroy_preview_capture_session_resources(XrSession session) {
   {
     std::lock_guard lock(g_vulkan_preview_sessions_mutex);
     auto it = g_vulkan_preview_sessions.find(session);
-    if (it == g_vulkan_preview_sessions.end())
-      return;
-    state = it->second;
-    g_vulkan_preview_sessions.erase(it);
+    if (it != g_vulkan_preview_sessions.end()) {
+      state = it->second;
+      g_vulkan_preview_sessions.erase(it);
+    }
   }
 
-  std::lock_guard capture_lock(state->mutex);
-  destroy_vulkan_preview_static_resources(*state);
+  if (state) {
+    std::lock_guard capture_lock(state->mutex);
+    destroy_vulkan_preview_static_resources(*state);
+  }
+
+  std::shared_ptr<OpenGLPreviewSessionState> opengl_state;
+  {
+    std::lock_guard lock(g_opengl_preview_sessions_mutex);
+    auto it = g_opengl_preview_sessions.find(session);
+    if (it != g_opengl_preview_sessions.end()) {
+      opengl_state = it->second;
+      g_opengl_preview_sessions.erase(it);
+    }
+  }
+
+  if (!opengl_state || !load_preview_gl_functions())
+    return;
+
+  const uint64_t context_key = current_gl_context_key();
+  if (context_key == 0)
+    return;
+
+  std::lock_guard capture_lock(opengl_state->mutex);
+  auto context_it = opengl_state->contexts.find(context_key);
+  if (context_it == opengl_state->contexts.end())
+    return;
+
+  destroy_opengl_preview_context_resources(*context_it->second);
+  opengl_state->contexts.erase(context_it);
 }
 
 enum class PreviewAttachmentKind {
@@ -1183,6 +1389,350 @@ static bool capture_opengl_preview(const PreviewCaptureRequest &request,
     glDeleteTextures(1, &dst_texture);
 
   return success;
+}
+
+static bool ensure_opengl_preview_slot_resources(OpenGLPreviewCaptureSlot &slot,
+                                                 uint32_t preview_width,
+                                                 uint32_t preview_height,
+                                                 std::string &status) {
+  if (!load_preview_gl_functions()) {
+    status = "OpenGL preview helpers are unavailable on this thread";
+    return false;
+  }
+
+  if (slot.src_fbo == 0)
+    preview_gl.GenFramebuffers(1, &slot.src_fbo);
+  if (slot.dst_fbo == 0)
+    preview_gl.GenFramebuffers(1, &slot.dst_fbo);
+  if (slot.pbo == 0)
+    preview_gl.GenBuffers(1, &slot.pbo);
+  if (slot.dst_texture == 0)
+    glGenTextures(1, &slot.dst_texture);
+
+  if (slot.src_fbo == 0 || slot.dst_fbo == 0 || slot.pbo == 0 ||
+      slot.dst_texture == 0) {
+    status = "Failed to allocate OpenGL preview slot resources";
+    return false;
+  }
+
+  const size_t byte_size = (size_t)preview_width * (size_t)preview_height * 4;
+  if (slot.preview_width != preview_width || slot.preview_height != preview_height) {
+    GLint prev_texture_2d = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_texture_2d);
+    glBindTexture(GL_TEXTURE_2D, slot.dst_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)preview_width,
+                 (GLsizei)preview_height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 nullptr);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_texture_2d);
+
+    slot.preview_width = preview_width;
+    slot.preview_height = preview_height;
+    slot.byte_size = byte_size;
+  }
+
+  if (slot.byte_size != byte_size)
+    slot.byte_size = byte_size;
+
+  return true;
+}
+
+static void harvest_completed_opengl_preview_captures(XrSession session,
+                                                      bool wait_for_all) {
+  if (!load_preview_gl_functions())
+    return;
+
+  const uint64_t context_key = current_gl_context_key();
+  if (context_key == 0)
+    return;
+
+  std::shared_ptr<OpenGLPreviewSessionState> session_state =
+      get_opengl_preview_session_state(session, false);
+  if (!session_state)
+    return;
+
+  std::vector<OpenGLPreviewHarvestResult> completed;
+  GLint prev_pixel_pack_buffer = 0;
+  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pixel_pack_buffer);
+
+  {
+    std::lock_guard lock(session_state->mutex);
+    auto context_it = session_state->contexts.find(context_key);
+    if (context_it == session_state->contexts.end())
+      return;
+
+    for (auto &slot : context_it->second->slots) {
+      if (!slot.in_flight || slot.fence == nullptr)
+        continue;
+
+      GLenum wait_result = preview_gl.ClientWaitSync(
+          slot.fence, wait_for_all ? GL_SYNC_FLUSH_COMMANDS_BIT : 0,
+          wait_for_all ? GL_TIMEOUT_IGNORED : 0);
+      if (!wait_for_all && wait_result == GL_TIMEOUT_EXPIRED)
+        continue;
+
+      OpenGLPreviewHarvestResult result;
+      result.swapchain = slot.swapchain;
+      int64_t finalize_begin_ns = now_ns();
+
+      if (wait_result == GL_WAIT_FAILED) {
+        result.status = "Failed to observe OpenGL preview completion fence";
+      } else {
+        preview_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, slot.pbo);
+        void *mapped =
+            preview_gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
+                                      (GLsizeiptr)slot.byte_size, GL_MAP_READ_BIT);
+        if (mapped == nullptr) {
+          result.status = "Failed to map the OpenGL preview PBO";
+        } else {
+          result.preview.rgba8.resize(slot.byte_size);
+          std::memcpy(result.preview.rgba8.data(), mapped, slot.byte_size);
+          preview_gl.UnmapBuffer(GL_PIXEL_PACK_BUFFER);
+          flip_rgba_rows(result.preview.rgba8, slot.preview_width,
+                         slot.preview_height);
+          result.preview.available = true;
+          result.preview.capture_serial = slot.capture_serial;
+          result.preview.image_index = slot.image_index;
+          result.preview.image_array_index = slot.image_array_index;
+          result.preview.width = slot.preview_width;
+          result.preview.height = slot.preview_height;
+          result.status = slot.image_array_index != 0
+                              ? "Captured OpenGL preview asynchronously from array layer 0"
+                              : "Captured OpenGL preview asynchronously";
+        }
+      }
+
+      int64_t finalize_end_ns = now_ns();
+      result.finalize_ms = ns_to_ms(finalize_begin_ns, finalize_end_ns);
+      if (slot.submit_end_ns != 0)
+        result.ready_latency_ms = ns_to_ms(slot.submit_end_ns, finalize_end_ns);
+
+      if (slot.fence != nullptr)
+        preview_gl.DeleteSync(slot.fence);
+      slot.fence = nullptr;
+      slot.in_flight = false;
+      slot.swapchain = XR_NULL_HANDLE;
+      slot.image_index = 0;
+      slot.image_array_index = 0;
+      slot.capture_serial = 0;
+      slot.submit_begin_ns = 0;
+      slot.submit_end_ns = 0;
+
+      completed.push_back(std::move(result));
+    }
+  }
+
+  preview_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pixel_pack_buffer);
+
+  for (auto &result : completed) {
+    InstanceData *data = GetInstanceDataFromSwapchain(result.swapchain);
+    if (data == nullptr)
+      continue;
+
+    std::unique_lock lock(data->state_mutex);
+    auto tracked_it = data->swapchains.find(result.swapchain);
+    if (tracked_it == data->swapchains.end())
+      continue;
+
+    TrackedSwapchain &tracked = tracked_it->second;
+    if (tracked.preview_inflight_count > 0)
+      tracked.preview_inflight_count--;
+
+    if (result.preview.available) {
+      tracked.latest_preview = result.preview;
+      tracked.preview_images[make_preview_key(result.preview.image_index,
+                                             result.preview.image_array_index)] =
+          result.preview;
+      tracked.preview_success_count++;
+    }
+
+    tracked.preview_status = result.status;
+    record_preview_timing(result.finalize_ms, tracked.preview_finalize_ms_last,
+                          tracked.preview_finalize_ms_max,
+                          tracked.preview_finalize_ms_total,
+                          tracked.preview_finalize_sample_count);
+    if (result.ready_latency_ms > 0.0f) {
+      record_preview_timing(result.ready_latency_ms,
+                            tracked.preview_ready_latency_ms_last,
+                            tracked.preview_ready_latency_ms_max,
+                            tracked.preview_ready_latency_ms_total,
+                            tracked.preview_ready_latency_sample_count);
+    }
+  }
+}
+
+static OpenGLPreviewSubmitResult
+submit_opengl_preview_capture(const PreviewCaptureRequest &request) {
+  OpenGLPreviewSubmitResult result;
+  if (!load_preview_gl_functions()) {
+    result.status = "OpenGL preview helpers are unavailable on this thread";
+    return result;
+  }
+
+  const uint64_t context_key = current_gl_context_key();
+  if (context_key == 0) {
+    result.status = "OpenGL preview requires a current application GL context";
+    return result;
+  }
+
+  std::shared_ptr<OpenGLPreviewSessionState> session_state =
+      get_opengl_preview_session_state(request.session, true);
+  if (!session_state) {
+    result.status = "Failed to allocate OpenGL preview session state";
+    return result;
+  }
+
+  PreviewCaptureConfig config = get_preview_capture_config();
+  if (request.width == 0 || request.height == 0) {
+    result.status = "Swapchain extent is zero";
+    return result;
+  }
+
+  uint32_t preview_width = request.width;
+  uint32_t preview_height = request.height;
+  uint32_t longest_edge = std::max(preview_width, preview_height);
+  if (longest_edge > (uint32_t)config.max_edge) {
+    float scale = (float)config.max_edge / (float)longest_edge;
+    preview_width = std::max(1u, (uint32_t)(preview_width * scale));
+    preview_height = std::max(1u, (uint32_t)(preview_height * scale));
+  }
+
+  int64_t submit_begin_ns = now_ns();
+  GLint prev_read_fbo = 0;
+  GLint prev_draw_fbo = 0;
+  GLint prev_texture_2d = 0;
+  GLint prev_read_buffer = 0;
+  GLint prev_draw_buffer = 0;
+  GLint prev_pack_alignment = 0;
+  GLint prev_pixel_pack_buffer = 0;
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_texture_2d);
+  glGetIntegerv(GL_READ_BUFFER, &prev_read_buffer);
+  glGetIntegerv(GL_DRAW_BUFFER, &prev_draw_buffer);
+  glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack_alignment);
+  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pixel_pack_buffer);
+
+  auto restore_gl_state = [&]() {
+    preview_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pixel_pack_buffer);
+    preview_gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+    preview_gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw_fbo);
+    glReadBuffer(prev_read_buffer);
+    glDrawBuffer(prev_draw_buffer);
+    glPixelStorei(GL_PACK_ALIGNMENT, prev_pack_alignment);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_texture_2d);
+  };
+
+  do {
+    std::lock_guard lock(session_state->mutex);
+    OpenGLPreviewContextState *context_state =
+        get_or_create_opengl_preview_context_state(*session_state, context_key);
+    if (context_state == nullptr) {
+      result.status = "Failed to allocate OpenGL preview context state";
+      break;
+    }
+
+    OpenGLPreviewCaptureSlot *slot = nullptr;
+    for (auto &candidate : context_state->slots) {
+      if (!candidate.in_flight) {
+        slot = &candidate;
+        break;
+      }
+    }
+    if (slot == nullptr) {
+      result.status = "All OpenGL preview capture slots are busy";
+      break;
+    }
+
+    if (!ensure_opengl_preview_slot_resources(*slot, preview_width,
+                                              preview_height, result.status)) {
+      break;
+    }
+
+    if (slot->fence != nullptr) {
+      preview_gl.DeleteSync(slot->fence);
+      slot->fence = nullptr;
+    }
+
+    preview_gl.BindFramebuffer(GL_READ_FRAMEBUFFER, slot->src_fbo);
+    switch (get_preview_attachment_kind(request)) {
+    case PreviewAttachmentKind::Texture2D:
+      preview_gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                      GL_TEXTURE_2D,
+                                      (GLuint)request.image_handle_value, 0);
+      break;
+    case PreviewAttachmentKind::Texture2DArrayLayer0:
+      preview_gl.FramebufferTextureLayer(GL_READ_FRAMEBUFFER,
+                                         GL_COLOR_ATTACHMENT0,
+                                         (GLuint)request.image_handle_value, 0,
+                                         0);
+      break;
+    case PreviewAttachmentKind::Unsupported:
+      result.status = "OpenGL preview attachment kind is unsupported";
+      break;
+    }
+    if (!result.status.empty())
+      break;
+
+    preview_gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, slot->dst_fbo);
+    preview_gl.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, slot->dst_texture, 0);
+
+    GLenum read_status = preview_gl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+    GLenum draw_status = preview_gl.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    if (read_status != GL_FRAMEBUFFER_COMPLETE ||
+        draw_status != GL_FRAMEBUFFER_COMPLETE) {
+      std::ostringstream oss;
+      oss << "Framebuffer incomplete (read=0x" << std::hex << read_status
+          << ", draw=0x" << draw_status << ")";
+      result.status = oss.str();
+      break;
+    }
+
+    preview_gl.BindBuffer(GL_PIXEL_PACK_BUFFER, slot->pbo);
+    preview_gl.BufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)slot->byte_size,
+                          nullptr, GL_STREAM_READ);
+
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    preview_gl.BlitFramebuffer(0, 0, (GLint)request.width, (GLint)request.height,
+                               0, 0, (GLint)preview_width,
+                               (GLint)preview_height, GL_COLOR_BUFFER_BIT,
+                               GL_LINEAR);
+
+    preview_gl.BindFramebuffer(GL_READ_FRAMEBUFFER, slot->dst_fbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, (GLsizei)preview_width, (GLsizei)preview_height,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    slot->fence = preview_gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (slot->fence == nullptr) {
+      result.status = "Failed to create the OpenGL preview fence";
+      break;
+    }
+    glFlush();
+
+    int64_t submit_end_ns = now_ns();
+    slot->in_flight = true;
+    slot->swapchain = request.swapchain;
+    slot->image_index = request.image_index;
+    slot->image_array_index = 0;
+    slot->capture_serial = request.release_serial + 1;
+    slot->submit_begin_ns = submit_begin_ns;
+    slot->submit_end_ns = submit_end_ns;
+
+    result.submitted = true;
+    result.app_thread_ms = ns_to_ms(submit_begin_ns, submit_end_ns);
+    result.status = request.array_size > 1
+                        ? "Submitted OpenGL preview capture from array layer 0"
+                        : "Submitted OpenGL preview capture";
+  } while (false);
+
+  restore_gl_state();
+  return result;
 }
 
 static void harvest_completed_vulkan_preview_captures(XrSession session,
@@ -1952,16 +2502,47 @@ XrResult XRAPI_CALL Layer_xrEnumerateSwapchainImages(
 
   XrResult result = data->next.xrEnumerateSwapchainImages(
       swapchain, imageCapacityInput, imageCountOutput, images);
-  if (XR_SUCCEEDED(result) && images != nullptr &&
-      imageCountOutput != nullptr) {
+  if (XR_SUCCEEDED(result) && images != nullptr && imageCountOutput != nullptr) {
     std::unique_lock lock(data->state_mutex);
     auto it = data->swapchains.find(swapchain);
     if (it != data->swapchains.end()) {
       it->second.images.clear();
       it->second.images.reserve(*imageCountOutput);
-      for (uint32_t image_index = 0; image_index < *imageCountOutput;
-           ++image_index)
-        it->second.images.push_back(track_swapchain_image(images[image_index]));
+      if (*imageCountOutput == 0)
+        return result;
+
+      switch (images[0].type) {
+      case XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR: {
+        auto *typed_images =
+            reinterpret_cast<const XrSwapchainImageOpenGLKHR *>(images);
+        for (uint32_t image_index = 0; image_index < *imageCountOutput;
+             ++image_index) {
+          it->second.images.push_back(track_swapchain_image(
+              reinterpret_cast<const XrSwapchainImageBaseHeader &>(
+                  typed_images[image_index])));
+        }
+        break;
+      }
+      case XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR: {
+        auto *typed_images =
+            reinterpret_cast<const XrSwapchainImageVulkanKHR *>(images);
+        for (uint32_t image_index = 0; image_index < *imageCountOutput;
+             ++image_index) {
+          it->second.images.push_back(track_swapchain_image(
+              reinterpret_cast<const XrSwapchainImageBaseHeader &>(
+                  typed_images[image_index])));
+        }
+        break;
+      }
+      default: {
+        TrackedSwapchainImage tracked;
+        tracked.type = images[0].type;
+        for (uint32_t image_index = 0; image_index < *imageCountOutput;
+             ++image_index)
+          it->second.images.push_back(tracked);
+        break;
+      }
+      }
     }
   }
 
@@ -2046,6 +2627,7 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
   std::string preview_status;
   bool has_captured_preview = false;
   bool attempted_preview_capture = false;
+  bool submitted_async_preview = false;
   float preview_app_thread_ms = 0.0f;
   bool have_request = false;
   {
@@ -2053,9 +2635,17 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
     have_request = build_preview_capture_request(data, swapchain, request);
   }
 
-  if (have_request && request.graphics_binding ==
-                          TrackedSession::GraphicsBindingKind::VULKAN) {
-    harvest_completed_vulkan_preview_captures(request.session, false);
+  if (have_request) {
+    switch (request.graphics_binding) {
+    case TrackedSession::GraphicsBindingKind::OPENGL:
+      harvest_completed_opengl_preview_captures(request.session, false);
+      break;
+    case TrackedSession::GraphicsBindingKind::VULKAN:
+      harvest_completed_vulkan_preview_captures(request.session, false);
+      break;
+    default:
+      break;
+    }
   }
 
   if (have_request) {
@@ -2064,11 +2654,12 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
     case TrackedSession::GraphicsBindingKind::OPENGL:
       skip_reason = preview_capture_skip_reason_opengl(request);
       if (skip_reason == nullptr) {
-        int64_t capture_begin_ns = now_ns();
-        attempted_preview_capture = true;
-        has_captured_preview =
-            capture_opengl_preview(request, captured_preview, preview_status);
-        preview_app_thread_ms = ns_to_ms(capture_begin_ns, now_ns());
+        OpenGLPreviewSubmitResult submit_result =
+            submit_opengl_preview_capture(request);
+        attempted_preview_capture = submit_result.submitted;
+        submitted_async_preview = submit_result.submitted;
+        preview_app_thread_ms = submit_result.app_thread_ms;
+        preview_status = submit_result.status;
       }
       break;
     case TrackedSession::GraphicsBindingKind::VULKAN:
@@ -2077,6 +2668,7 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
         VulkanPreviewSubmitResult submit_result =
             submit_vulkan_preview_capture(request);
         attempted_preview_capture = submit_result.submitted;
+        submitted_async_preview = submit_result.submitted;
         preview_app_thread_ms = submit_result.app_thread_ms;
         preview_status = submit_result.status;
       }
@@ -2127,8 +2719,7 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
               tracked.preview_app_thread_ms_total,
               tracked.preview_app_thread_sample_count);
         }
-        if (request.graphics_binding ==
-            TrackedSession::GraphicsBindingKind::VULKAN) {
+        if (submitted_async_preview) {
           tracked.preview_inflight_count++;
           tracked.preview_inflight_peak =
               std::max(tracked.preview_inflight_peak,
@@ -2138,7 +2729,8 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
         tracked.preview_skip_count++;
       }
 
-      if (has_captured_preview || attempted_preview_capture || !had_preview) {
+      if (!preview_status.empty() || has_captured_preview ||
+          attempted_preview_capture || !had_preview) {
         tracked.preview_status = preview_status;
       }
 
@@ -2189,9 +2781,17 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
       std::cout << preview_log_line << std::endl;
   }
 
-  if (have_request && request.graphics_binding ==
-                          TrackedSession::GraphicsBindingKind::VULKAN) {
-    harvest_completed_vulkan_preview_captures(request.session, false);
+  if (have_request) {
+    switch (request.graphics_binding) {
+    case TrackedSession::GraphicsBindingKind::OPENGL:
+      harvest_completed_opengl_preview_captures(request.session, false);
+      break;
+    case TrackedSession::GraphicsBindingKind::VULKAN:
+      harvest_completed_vulkan_preview_captures(request.session, false);
+      break;
+    default:
+      break;
+    }
   }
   return result;
 }
