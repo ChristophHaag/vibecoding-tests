@@ -7,7 +7,7 @@ debug_layer/
 ├── CMakeLists.txt                 Build system (FetchContent for SDL3, ImGui, OpenXR headers)
 ├── XrApiLayer_debug_gui.json      Layer manifest (loader reads this)
 ├── XrApiLayer_debug_gui.map       Linker version script (exports only negotiate symbol)
-├── xr-with-debug-gui.sh.in        CMake template → build-ninja/xr-with-debug-gui.sh
+├── xr-with-debug-gui.sh.in        CMake template → build/xr-with-debug-gui.sh
 ├── README.md
 ├── DECISIONS.md                   Architecture rationale
 ├── PLAN.md                        Original feature plan
@@ -37,18 +37,18 @@ debug_layer/
 ## Building
 
 ```sh
-cmake -G Ninja -B build-ninja
-cmake --build build-ninja -j$(nproc)
+cmake -G Ninja -B build
+cmake --build build -j$(nproc)
 ```
 
 The build defaults to **RelWithDebInfo**. ImGui's draw routines (AddPolyline, etc.) are
 unusably slow at `-O0` — always build with optimizations enabled.
 
-Binary: `build-ninja/libXrApiLayer_debug_gui.so`
-Wrapper: `build-ninja/xr-with-debug-gui.sh`
+Binary: `build/libXrApiLayer_debug_gui.so`
+Wrapper: `build/xr-with-debug-gui.sh`
 
 Prefer Ninja for agent-created builds.  Avoid generating fresh build output in
-tracked `build/` directories when an untracked `build-ninja/` tree will do.
+tracked `build/` directories when an untracked `build/` tree will do.
 
 No external dependencies beyond system OpenGL + X11 dev headers. SDL3, Dear ImGui (docking branch), and OpenXR-SDK headers are fetched via CMake FetchContent.
 
@@ -110,7 +110,7 @@ main dockspace instead of floating.
 - **SDL3 is statically linked** with `-Wl,-Bsymbolic -Wl,--exclude-libs,ALL` so no SDL symbols leak. This prevents conflicts with apps using SDL2. Never switch to shared SDL3.
 - **`XR_NO_PROTOTYPES`** is defined — use `PFN_xr*` function pointer types, not direct prototypes.
 - When Vulkan bindings are enabled, include `vulkan/vulkan.h` before `openxr/openxr_platform.h` and protect that order from `clang-format`; otherwise the OpenXR Vulkan binding structs will not compile.
-- The version script `XrApiLayer_debug_gui.map` ensures only `xrNegotiateLoaderApiLayerInterface` is exported. Verify with `nm -D build-ninja/libXrApiLayer_debug_gui.so | grep -w T`.
+- The version script `XrApiLayer_debug_gui.map` ensures only `xrNegotiateLoaderApiLayerInterface` is exported. Verify with `nm -D build/libXrApiLayer_debug_gui.so | grep -w T`.
 - ImGui docking branch is required (tag pattern: `v*-docking`). The `DockBuilder` API is from `imgui_internal.h`.
 - Layout persistence: `~/.config/openxr_debug_gui/imgui.ini`. Delete to reset.
 - OpenGL preview capture happens on the application thread before `xrReleaseSwapchainImage`, not on the GUI thread. This is deliberate to avoid cross-context ownership issues.
@@ -143,16 +143,16 @@ main dockspace instead of floating.
 Use the wrapper script against any OpenXR app:
 
 ```sh
-build-ninja/xr-with-debug-gui.sh <openxr-app> [args...]
+build/xr-with-debug-gui.sh <openxr-app> [args...]
 ```
 
 Or with interceptors only (no window):
 
 ```sh
-build-ninja/xr-with-debug-gui.sh --no-gui <openxr-app> [args...]
+build/xr-with-debug-gui.sh --no-gui <openxr-app> [args...]
 ```
 
-Prefer the `build-ninja` wrapper for smoke tests. It points `XR_API_LAYER_PATH` at
+Prefer the `build` wrapper for smoke tests. It points `XR_API_LAYER_PATH` at
 the manifest-only build directory and avoids OpenXR loader warnings from unrelated
 files in older tracked build trees.
 
@@ -171,7 +171,7 @@ sleep infinity | env \
     XR_DEBUG_GUI_PREVIEW_LOG=1 \
     XR_DEBUG_GUI_PREVIEW_INTERVAL=1 \
     stdbuf -oL -eL \
-    build-ninja/xr-with-debug-gui.sh --no-gui /usr/bin/hello_xr -G Vulkan2 \
+    build/xr-with-debug-gui.sh --no-gui /usr/bin/hello_xr -G Vulkan2 \
     2>&1 | tee /tmp/hello_xr_vulkan_validation.log
 
 rg -n "Captured Vulkan preview|VUID|Validation Error|ERROR:" /tmp/hello_xr_vulkan_validation.log

@@ -43,22 +43,22 @@ after a Monado protocol change picks up the new layout automatically.
 From the repository root (only needs to be done once, or after source changes):
 
 ```sh
-cmake -G Ninja -B build-ninja
-cmake --build build-ninja
+cmake -G Ninja -B build
+cmake --build build
 ```
 
-Binary: `build-ninja/remote-driver-client/monado-remote-client`
+Binary: `build/remote-driver-client/monado-remote-client`
 
 Prefer Ninja for agent-driven builds.  Do not generate fresh build output into
-tracked `build/` directories when an untracked `build-ninja/` or similar build
+tracked `build/` directories when an untracked `build/` or similar build
 tree is an option.
 
 `monado/build` must already exist (generated headers live there).  To build
 Monado itself from scratch:
 
 ```sh
-cmake -G Ninja -B monado/build-ninja monado
-cmake --build monado/build-ninja
+cmake -G Ninja -B monado/build monado
+cmake --build monado/build
 ```
 
 ---
@@ -217,7 +217,7 @@ sleep infinity | env \
   XR_DEBUG_GUI_PREVIEW_LOG=1 \
   XR_DEBUG_GUI_PREVIEW_INTERVAL=1 \
   stdbuf -oL -eL \
-  debug_layer/build-ninja/xr-with-debug-gui.sh --no-gui /usr/bin/hello_xr -G Vulkan2 \
+  debug_layer/build/xr-with-debug-gui.sh --no-gui /usr/bin/hello_xr -G Vulkan2 \
   2>&1 | tee /tmp/hello_xr_vulkan_validation.log
 
 rg -n "Captured Vulkan preview|VUID|Validation Error|ERROR:" /tmp/hello_xr_vulkan_validation.log
@@ -238,11 +238,11 @@ symlink and exercises hand tracking, plane detection, and the
 
 ```sh
 # From the vibecoding-tests/ root — only needed once or after source changes:
-cmake -G Ninja -B openxr-simple-playground/build-ninja openxr-simple-playground
-cmake --build openxr-simple-playground/build-ninja
+cmake -G Ninja -B openxr-simple-playground/build openxr-simple-playground
+cmake --build openxr-simple-playground/build
 ```
 
-Binary: `openxr-simple-playground/build-ninja/openxr-playground`
+Binary: `openxr-simple-playground/build/openxr-playground`
 
 ### Running openxr-playground
 
@@ -260,7 +260,7 @@ until grep -q "Listening on port" /tmp/monado.log 2>/dev/null; do sleep 0.2; don
 
 # Run the playground (pipe stdin so it doesn't get EOF immediately)
 LOG=/tmp/playground.log
-(sleep infinity) | openxr-simple-playground/build-ninja/openxr-playground >"$LOG" 2>&1 &
+(sleep infinity) | openxr-simple-playground/build/openxr-playground >"$LOG" 2>&1 &
 APP_PID=$!
 ```
 

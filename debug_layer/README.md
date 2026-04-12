@@ -35,8 +35,8 @@ An OpenXR API layer that opens a standalone Dear ImGui window showing live debug
 ## Building
 
 ```sh
-cmake -G Ninja -B build-ninja
-cmake --build build-ninja -j$(nproc)
+cmake -G Ninja -B build
+cmake --build build -j$(nproc)
 ```
 
 The default build type is **RelWithDebInfo** — this is important because ImGui's draw routines are unusably slow at `-O0`.
@@ -45,9 +45,9 @@ Requires: CMake ≥ 3.20, C++17 compiler, OpenGL, Vulkan, X11 dev headers.
 SDL3, Dear ImGui, and OpenXR headers are fetched automatically via FetchContent.
 
 Output:
-- `build-ninja/libXrApiLayer_debug_gui.so`
-- `build-ninja/XrApiLayer_debug_gui.json`
-- `build-ninja/xr-with-debug-gui.sh`
+- `build/libXrApiLayer_debug_gui.so`
+- `build/XrApiLayer_debug_gui.json`
+- `build/xr-with-debug-gui.sh`
 
 ## Usage
 
@@ -55,11 +55,11 @@ Output:
 
 ```sh
 # Basic usage
-build-ninja/xr-with-debug-gui.sh my_xr_app --app-args
+build/xr-with-debug-gui.sh my_xr_app --app-args
 
 # With options
-build-ninja/xr-with-debug-gui.sh --fps 60 my_xr_app
-build-ninja/xr-with-debug-gui.sh --no-gui my_xr_app   # interceptors only, no window
+build/xr-with-debug-gui.sh --fps 60 my_xr_app
+build/xr-with-debug-gui.sh --no-gui my_xr_app   # interceptors only, no window
 ```
 
 The script is callable from any directory — it has the build path baked in.
@@ -68,7 +68,7 @@ The script is callable from any directory — it has the build path baked in.
 
 ```sh
 export XR_ENABLE_API_LAYERS=XR_APILAYER_DEBUG_gui
-export XR_API_LAYER_PATH=/path/to/debug_layer/build-ninja
+export XR_API_LAYER_PATH=/path/to/debug_layer/build
 my_xr_app
 ```
 
@@ -118,7 +118,7 @@ sleep infinity | env \
     XR_DEBUG_GUI_PREVIEW_LOG=1 \
     XR_DEBUG_GUI_PREVIEW_INTERVAL=1 \
     stdbuf -oL -eL \
-    build-ninja/xr-with-debug-gui.sh --no-gui /usr/bin/hello_xr -G Vulkan2 \
+    build/xr-with-debug-gui.sh --no-gui /usr/bin/hello_xr -G Vulkan2 \
     2>&1 | tee /tmp/hello_xr_vulkan_validation.log
 
 rg -n "Captured Vulkan preview|VUID|Validation Error|ERROR:" /tmp/hello_xr_vulkan_validation.log
@@ -160,7 +160,7 @@ gui/gui_perf.h/.cpp     Performance observatory: stacked bars, real-time timelin
 - Only `xrNegotiateLoaderApiLayerInterface` is exported from the .so
 - Newly added panels should define a fallback dock target with `ImGui::SetNextWindowDockID(..., ImGuiCond_Appearing)` because persisted `imgui.ini` layouts bypass the first-run dock builder.
 - The Composition Layers panel uses retained previews and retained recent-layer state to reduce flicker from rotating swapchain indices and temporarily omitted layers.
-- Use the `build-ninja/xr-with-debug-gui.sh` wrapper for smoke tests; it points `XR_API_LAYER_PATH` at the manifest-only Ninja build directory and avoids loader warnings from unrelated files.
+- Use the `build/xr-with-debug-gui.sh` wrapper for smoke tests; it points `XR_API_LAYER_PATH` at the manifest-only Ninja build directory and avoids loader warnings from unrelated files.
 - Layout resets: delete `~/.config/openxr_debug_gui/imgui.ini`
 
 ## Licensing
