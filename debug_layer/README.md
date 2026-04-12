@@ -12,7 +12,7 @@ An OpenXR API layer that opens a standalone Dear ImGui window showing live debug
 - **HMD view frustums** — `xrLocateViews` results shown as orange wireframe FOV frustums with near-plane rectangles
 - **Composition layer inspector** — shows recently submitted composition layers, per-layer metadata, sub-image rects, swapchain/image indices, and depth-chain info
 - **OpenGL composition previews** — captures throttled previews of OpenGL/EGL color swapchain images on release, caches them per swapchain image, and displays them inside the composition layer inspector
-- **Vulkan composition previews** — captures throttled previews of Vulkan color swapchain images on release using the application's Vulkan device and queue, then displays the staged thumbnails in the composition layer inspector
+- **Vulkan composition previews** — submits throttled preview captures of Vulkan color swapchain images on release using the application's Vulkan device and queue, then harvests the staged thumbnails asynchronously for display in the composition layer inspector
 - **Preview inspect mode** — click a preview to toggle from fit view into actual-pixel inspection with wheel zoom, reset controls, and RGBA pixel hover readout
 - **Retained live layer view** — the inspector keeps recently missing layers around for a few frames and marks them stale, reducing panel flicker when apps omit a layer from one `xrEndFrame`
 - **Label anti-overlap** — overlapping space labels are automatically nudged apart
@@ -80,6 +80,7 @@ my_xr_app
 | `XR_DEBUG_GUI_FPS=N` | GUI render rate, 1–240 (default: 30) |
 | `XR_DEBUG_GUI_PREVIEW_INTERVAL=N` | Capture every `N`th eligible previewable swapchain release; `0` disables preview capture |
 | `XR_DEBUG_GUI_PREVIEW_MAX_EDGE=N` | Maximum thumbnail edge length before downscaling (default: 320) |
+| `XR_DEBUG_GUI_PREVIEW_VULKAN_INFLIGHT=N` | Number of Vulkan preview capture slots kept in flight before new submits are skipped (default: 4) |
 | `XR_DEBUG_GUI_PREVIEW_LOG=1` | Log first successful preview capture and distinct preview skip/failure reasons per swapchain |
 | `XR_DEBUG_GUI_PREVIEW_LOG=2` | Log every preview attempt and skip; useful only for short debugging runs |
 
@@ -89,10 +90,11 @@ Legacy `XR_DEBUG_GUI_GL_PREVIEW_*` variable names are still accepted for compati
 
 - The layer deep-copies `xrEndFrame` layer submissions into tracked state so the GUI never depends on application-owned pointers after the call returns.
 - OpenGL preview capture runs on the application thread before `xrReleaseSwapchainImage`, where the image is still owned by the app and safe to read with the app's current context.
-- Vulkan preview capture also runs on the application thread before `xrReleaseSwapchainImage`, using the application's device and queue to draw a sampled thumbnail into an offscreen image and copy it into a staging buffer.
+- Vulkan preview capture still records work on the application thread before `xrReleaseSwapchainImage`, but the steady-state path now only submits GPU work there. Fence polling, staging invalidation, and CPU-side thumbnail copies are harvested asynchronously on later releases.
 - The preview path uses direct GL proc lookup (`eglGetProcAddress` / `glXGetProcAddressARB`) instead of SDL, because the app thread is not required to initialize SDL.
 - Captured previews are cached per `(swapchain, image index, array index)` instead of only keeping the newest preview for a swapchain. This avoids flicker when apps rotate through swapchain images.
 - The Composition Layers panel renders a short retained live set of recent layers instead of only the last frame. Layers missing for a few frames are marked stale before being dropped.
+- The Composition Layers panel now shows preview app-thread time, async finalize time, ready latency, and in-flight depth so capture overhead can be compared directly against the frame timing graphs.
 - Current preview support includes desktop OpenGL, `XR_MNDX_egl_enable`, `XR_KHR_vulkan_enable`, and `XR_KHR_vulkan_enable2` sessions. Other graphics APIs still show metadata without image content.
 - Current preview limitations:
   - Cube and other multi-face swapchains are metadata-only.
@@ -100,6 +102,12 @@ Legacy `XR_DEBUG_GUI_GL_PREVIEW_*` variable names are still accepted for compati
   - Vulkan previews currently require sampled, single-sample images.
   - Array swapchains currently preview layer 0 only.
   - Preview capture is intended for debugging, not zero-copy production display.
+
+## Preview Benchmarking
+
+- Use the Composition Layers panel to compare preview `attempts`, `success`, `skipped`, app-thread time, finalize time, and ready latency for a live swapchain.
+- Use the Performance panel to compare `xrReleaseSwapchainImage`, swapchain, app-work, and `xrEndFrame` timing with preview capture disabled vs. `XR_DEBUG_GUI_PREVIEW_INTERVAL=1`.
+- For Vulkan, the key steady-state number is preview app-thread time. In a healthy async path it should stay well below the deferred finalize and ready-latency numbers.
 
 ## Vulkan Validation Smoke Test
 

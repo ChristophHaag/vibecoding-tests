@@ -45,6 +45,7 @@ static float ns_to_ms(int64_t a, int64_t b) { return (float)((b - a) * 1e-6); }
 struct PreviewCaptureConfig {
   int capture_interval = 2;
   int max_edge = 320;
+  int vulkan_inflight_slots = 4;
 };
 
 static int parse_env_int(const char *name, int fallback, int min_value,
@@ -80,9 +81,20 @@ static PreviewCaptureConfig get_preview_capture_config() {
     c.max_edge = parse_env_int_with_legacy("XR_DEBUG_GUI_PREVIEW_MAX_EDGE",
                                            "XR_DEBUG_GUI_GL_PREVIEW_MAX_EDGE",
                                            320, 32, 2048);
+    c.vulkan_inflight_slots =
+        parse_env_int("XR_DEBUG_GUI_PREVIEW_VULKAN_INFLIGHT", 4, 1, 16);
     return c;
   }();
   return config;
+}
+
+static void record_preview_timing(float sample_ms, float &last_ms,
+                                  float &max_ms, double &total_ms,
+                                  uint64_t &sample_count) {
+  last_ms = sample_ms;
+  max_ms = std::max(max_ms, sample_ms);
+  total_ms += (double)sample_ms;
+  sample_count++;
 }
 
 template <typename Handle> static uint64_t pack_handle(Handle handle) {
@@ -137,22 +149,10 @@ struct VulkanPreviewSessionBinding {
   uint32_t queue_index = 0;
 };
 
-struct VulkanPreviewSessionState {
-  std::mutex mutex;
-  VulkanPreviewSessionBinding binding;
-  VkQueue queue = VK_NULL_HANDLE;
-  VkCommandPool command_pool = VK_NULL_HANDLE;
+struct VulkanPreviewCaptureSlot {
   VkCommandBuffer command_buffer = VK_NULL_HANDLE;
   VkFence fence = VK_NULL_HANDLE;
-  VkSampler sampler = VK_NULL_HANDLE;
-  VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
-  VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
   VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-  VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-  VkShaderModule vertex_shader = VK_NULL_HANDLE;
-  VkShaderModule fragment_shader = VK_NULL_HANDLE;
-  VkRenderPass render_pass = VK_NULL_HANDLE;
-  VkPipeline pipeline = VK_NULL_HANDLE;
   VkImage destination_image = VK_NULL_HANDLE;
   VkDeviceMemory destination_memory = VK_NULL_HANDLE;
   VkImageView destination_image_view = VK_NULL_HANDLE;
@@ -164,7 +164,47 @@ struct VulkanPreviewSessionState {
   VkDeviceSize staging_buffer_size = 0;
   uint32_t destination_width = 0;
   uint32_t destination_height = 0;
+  VkImageView source_image_view = VK_NULL_HANDLE;
+  bool in_flight = false;
+  XrSwapchain swapchain = XR_NULL_HANDLE;
+  uint32_t image_index = 0;
+  uint32_t image_array_index = 0;
+  uint64_t capture_serial = 0;
+  uint32_t preview_width = 0;
+  uint32_t preview_height = 0;
+  int64_t submit_begin_ns = 0;
+  int64_t submit_end_ns = 0;
+};
+
+struct VulkanPreviewSubmitResult {
+  bool submitted = false;
+  float app_thread_ms = 0.0f;
+  std::string status;
+};
+
+struct VulkanPreviewHarvestResult {
+  XrSwapchain swapchain = XR_NULL_HANDLE;
+  TrackedPreviewImage preview;
+  std::string status;
+  float finalize_ms = 0.0f;
+  float ready_latency_ms = 0.0f;
+};
+
+struct VulkanPreviewSessionState {
+  std::mutex mutex;
+  VulkanPreviewSessionBinding binding;
+  VkQueue queue = VK_NULL_HANDLE;
+  VkCommandPool command_pool = VK_NULL_HANDLE;
+  VkSampler sampler = VK_NULL_HANDLE;
+  VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+  VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
+  VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+  VkShaderModule vertex_shader = VK_NULL_HANDLE;
+  VkShaderModule fragment_shader = VK_NULL_HANDLE;
+  VkRenderPass render_pass = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
   bool static_resources_ready = false;
+  std::vector<VulkanPreviewCaptureSlot> slots;
 };
 
 static std::mutex g_vulkan_preview_sessions_mutex;
@@ -238,40 +278,58 @@ get_vulkan_preview_session_state(XrSession session) {
   return it != g_vulkan_preview_sessions.end() ? it->second : nullptr;
 }
 
-static void
-destroy_vulkan_preview_target_resources(VulkanPreviewSessionState &state) {
-  VkDevice device = state.binding.device;
+static void destroy_vulkan_preview_slot_submission_resources(
+    VkDevice device, VulkanPreviewCaptureSlot &slot) {
   if (device == VK_NULL_HANDLE)
     return;
 
-  if (state.mapped_staging != nullptr &&
-      state.staging_memory != VK_NULL_HANDLE) {
-    vkUnmapMemory(device, state.staging_memory);
-    state.mapped_staging = nullptr;
-  }
-  if (state.framebuffer != VK_NULL_HANDLE)
-    vkDestroyFramebuffer(device, state.framebuffer, nullptr);
-  if (state.destination_image_view != VK_NULL_HANDLE)
-    vkDestroyImageView(device, state.destination_image_view, nullptr);
-  if (state.destination_image != VK_NULL_HANDLE)
-    vkDestroyImage(device, state.destination_image, nullptr);
-  if (state.destination_memory != VK_NULL_HANDLE)
-    vkFreeMemory(device, state.destination_memory, nullptr);
-  if (state.staging_buffer != VK_NULL_HANDLE)
-    vkDestroyBuffer(device, state.staging_buffer, nullptr);
-  if (state.staging_memory != VK_NULL_HANDLE)
-    vkFreeMemory(device, state.staging_memory, nullptr);
+  if (slot.source_image_view != VK_NULL_HANDLE)
+    vkDestroyImageView(device, slot.source_image_view, nullptr);
 
-  state.framebuffer = VK_NULL_HANDLE;
-  state.destination_image_view = VK_NULL_HANDLE;
-  state.destination_image = VK_NULL_HANDLE;
-  state.destination_memory = VK_NULL_HANDLE;
-  state.staging_buffer = VK_NULL_HANDLE;
-  state.staging_memory = VK_NULL_HANDLE;
-  state.staging_buffer_size = 0;
-  state.destination_width = 0;
-  state.destination_height = 0;
-  state.staging_memory_coherent = false;
+  slot.source_image_view = VK_NULL_HANDLE;
+  slot.in_flight = false;
+  slot.swapchain = XR_NULL_HANDLE;
+  slot.image_index = 0;
+  slot.image_array_index = 0;
+  slot.capture_serial = 0;
+  slot.preview_width = 0;
+  slot.preview_height = 0;
+  slot.submit_begin_ns = 0;
+  slot.submit_end_ns = 0;
+}
+
+static void destroy_vulkan_preview_slot_target_resources(
+    VkDevice device, VulkanPreviewCaptureSlot &slot) {
+  if (device == VK_NULL_HANDLE)
+    return;
+
+  if (slot.mapped_staging != nullptr && slot.staging_memory != VK_NULL_HANDLE) {
+    vkUnmapMemory(device, slot.staging_memory);
+    slot.mapped_staging = nullptr;
+  }
+  if (slot.framebuffer != VK_NULL_HANDLE)
+    vkDestroyFramebuffer(device, slot.framebuffer, nullptr);
+  if (slot.destination_image_view != VK_NULL_HANDLE)
+    vkDestroyImageView(device, slot.destination_image_view, nullptr);
+  if (slot.destination_image != VK_NULL_HANDLE)
+    vkDestroyImage(device, slot.destination_image, nullptr);
+  if (slot.destination_memory != VK_NULL_HANDLE)
+    vkFreeMemory(device, slot.destination_memory, nullptr);
+  if (slot.staging_buffer != VK_NULL_HANDLE)
+    vkDestroyBuffer(device, slot.staging_buffer, nullptr);
+  if (slot.staging_memory != VK_NULL_HANDLE)
+    vkFreeMemory(device, slot.staging_memory, nullptr);
+
+  slot.framebuffer = VK_NULL_HANDLE;
+  slot.destination_image_view = VK_NULL_HANDLE;
+  slot.destination_image = VK_NULL_HANDLE;
+  slot.destination_memory = VK_NULL_HANDLE;
+  slot.staging_buffer = VK_NULL_HANDLE;
+  slot.staging_memory = VK_NULL_HANDLE;
+  slot.staging_buffer_size = 0;
+  slot.destination_width = 0;
+  slot.destination_height = 0;
+  slot.staging_memory_coherent = false;
 }
 
 static void
@@ -280,7 +338,18 @@ destroy_vulkan_preview_static_resources(VulkanPreviewSessionState &state) {
   if (device == VK_NULL_HANDLE)
     return;
 
-  destroy_vulkan_preview_target_resources(state);
+  for (auto &slot : state.slots) {
+    if (slot.in_flight && slot.fence != VK_NULL_HANDLE)
+      vkWaitForFences(device, 1, &slot.fence, VK_TRUE, UINT64_MAX);
+    destroy_vulkan_preview_slot_submission_resources(device, slot);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
+    if (slot.fence != VK_NULL_HANDLE)
+      vkDestroyFence(device, slot.fence, nullptr);
+    slot.fence = VK_NULL_HANDLE;
+    slot.command_buffer = VK_NULL_HANDLE;
+    slot.descriptor_set = VK_NULL_HANDLE;
+  }
+  state.slots.clear();
 
   if (state.pipeline != VK_NULL_HANDLE)
     vkDestroyPipeline(device, state.pipeline, nullptr);
@@ -300,8 +369,6 @@ destroy_vulkan_preview_static_resources(VulkanPreviewSessionState &state) {
     vkDestroySampler(device, state.sampler, nullptr);
   if (state.command_pool != VK_NULL_HANDLE)
     vkDestroyCommandPool(device, state.command_pool, nullptr);
-  if (state.fence != VK_NULL_HANDLE)
-    vkDestroyFence(device, state.fence, nullptr);
 
   state.pipeline = VK_NULL_HANDLE;
   state.render_pass = VK_NULL_HANDLE;
@@ -312,9 +379,6 @@ destroy_vulkan_preview_static_resources(VulkanPreviewSessionState &state) {
   state.descriptor_set_layout = VK_NULL_HANDLE;
   state.sampler = VK_NULL_HANDLE;
   state.command_pool = VK_NULL_HANDLE;
-  state.command_buffer = VK_NULL_HANDLE;
-  state.fence = VK_NULL_HANDLE;
-  state.descriptor_set = VK_NULL_HANDLE;
   state.queue = VK_NULL_HANDLE;
   state.static_resources_ready = false;
 }
@@ -406,20 +470,29 @@ ensure_vulkan_preview_static_resources(VulkanPreviewSessionState &state,
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
   command_buffer_info.commandPool = state.command_pool;
   command_buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  command_buffer_info.commandBufferCount = 1;
+  PreviewCaptureConfig config = get_preview_capture_config();
+  const uint32_t slot_count = (uint32_t)config.vulkan_inflight_slots;
+  state.slots.assign(slot_count, VulkanPreviewCaptureSlot{});
+
+  std::vector<VkCommandBuffer> command_buffers(slot_count, VK_NULL_HANDLE);
+  command_buffer_info.commandBufferCount = slot_count;
   if (vkAllocateCommandBuffers(device, &command_buffer_info,
-                               &state.command_buffer) != VK_SUCCESS) {
-    status = "Failed to allocate the Vulkan preview command buffer";
+                               command_buffers.data()) != VK_SUCCESS) {
+    status = "Failed to allocate the Vulkan preview command buffers";
     destroy_vulkan_preview_static_resources(state);
     return false;
   }
 
   VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
   fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-  if (vkCreateFence(device, &fence_info, nullptr, &state.fence) != VK_SUCCESS) {
-    status = "Failed to create the Vulkan preview fence";
-    destroy_vulkan_preview_static_resources(state);
-    return false;
+  for (uint32_t slot_index = 0; slot_index < slot_count; ++slot_index) {
+    state.slots[slot_index].command_buffer = command_buffers[slot_index];
+    if (vkCreateFence(device, &fence_info, nullptr,
+                      &state.slots[slot_index].fence) != VK_SUCCESS) {
+      status = "Failed to create a Vulkan preview fence";
+      destroy_vulkan_preview_static_resources(state);
+      return false;
+    }
   }
 
   VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -457,11 +530,11 @@ ensure_vulkan_preview_static_resources(VulkanPreviewSessionState &state,
 
   VkDescriptorPoolSize descriptor_pool_size{};
   descriptor_pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  descriptor_pool_size.descriptorCount = 1;
+  descriptor_pool_size.descriptorCount = slot_count;
 
   VkDescriptorPoolCreateInfo descriptor_pool_info{
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  descriptor_pool_info.maxSets = 1;
+  descriptor_pool_info.maxSets = slot_count;
   descriptor_pool_info.poolSizeCount = 1;
   descriptor_pool_info.pPoolSizes = &descriptor_pool_size;
   if (vkCreateDescriptorPool(device, &descriptor_pool_info, nullptr,
@@ -474,14 +547,19 @@ ensure_vulkan_preview_static_resources(VulkanPreviewSessionState &state,
   VkDescriptorSetAllocateInfo descriptor_set_info{
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
   descriptor_set_info.descriptorPool = state.descriptor_pool;
-  descriptor_set_info.descriptorSetCount = 1;
-  descriptor_set_info.pSetLayouts = &state.descriptor_set_layout;
+  descriptor_set_info.descriptorSetCount = slot_count;
+  std::vector<VkDescriptorSetLayout> set_layouts(slot_count,
+                                                 state.descriptor_set_layout);
+  descriptor_set_info.pSetLayouts = set_layouts.data();
+  std::vector<VkDescriptorSet> descriptor_sets(slot_count, VK_NULL_HANDLE);
   if (vkAllocateDescriptorSets(device, &descriptor_set_info,
-                               &state.descriptor_set) != VK_SUCCESS) {
-    status = "Failed to allocate the Vulkan preview descriptor set";
+                               descriptor_sets.data()) != VK_SUCCESS) {
+    status = "Failed to allocate the Vulkan preview descriptor sets";
     destroy_vulkan_preview_static_resources(state);
     return false;
   }
+  for (uint32_t slot_index = 0; slot_index < slot_count; ++slot_index)
+    state.slots[slot_index].descriptor_set = descriptor_sets[slot_index];
 
   if (!create_vulkan_shader_module(device, kVulkanPreviewVertexShaderSpv,
                                    sizeof(kVulkanPreviewVertexShaderSpv),
@@ -617,16 +695,17 @@ ensure_vulkan_preview_static_resources(VulkanPreviewSessionState &state,
 }
 
 static bool ensure_vulkan_preview_target_resources(
-    VulkanPreviewSessionState &state, uint32_t preview_width,
+    VulkanPreviewSessionState &state, VulkanPreviewCaptureSlot &slot,
+    uint32_t preview_width,
     uint32_t preview_height, bool &recreated, std::string &status) {
   recreated = false;
-  if (state.destination_image != VK_NULL_HANDLE &&
-      state.destination_width == preview_width &&
-      state.destination_height == preview_height &&
-      state.staging_buffer != VK_NULL_HANDLE && state.mapped_staging != nullptr)
+  if (slot.destination_image != VK_NULL_HANDLE &&
+      slot.destination_width == preview_width &&
+      slot.destination_height == preview_height &&
+      slot.staging_buffer != VK_NULL_HANDLE && slot.mapped_staging != nullptr)
     return true;
 
-  destroy_vulkan_preview_target_resources(state);
+  destroy_vulkan_preview_slot_target_resources(state.binding.device, slot);
   recreated = true;
 
   VkDevice device = state.binding.device;
@@ -644,15 +723,15 @@ static bool ensure_vulkan_preview_target_resources(
   image_info.usage =
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (vkCreateImage(device, &image_info, nullptr, &state.destination_image) !=
+  if (vkCreateImage(device, &image_info, nullptr, &slot.destination_image) !=
       VK_SUCCESS) {
     status = "Failed to create the Vulkan preview destination image";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
 
   VkMemoryRequirements image_memory_requirements;
-  vkGetImageMemoryRequirements(device, state.destination_image,
+  vkGetImageMemoryRequirements(device, slot.destination_image,
                                &image_memory_requirements);
   uint32_t image_memory_type_index = 0;
   bool image_memory_preferred = false;
@@ -663,7 +742,7 @@ static bool ensure_vulkan_preview_target_resources(
                                image_memory_type_index,
                                image_memory_preferred)) {
     status = "Failed to find device-local Vulkan memory for the preview image";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
 
@@ -672,21 +751,21 @@ static bool ensure_vulkan_preview_target_resources(
   image_memory_info.allocationSize = image_memory_requirements.size;
   image_memory_info.memoryTypeIndex = image_memory_type_index;
   if (vkAllocateMemory(device, &image_memory_info, nullptr,
-                       &state.destination_memory) != VK_SUCCESS) {
+                       &slot.destination_memory) != VK_SUCCESS) {
     status = "Failed to allocate Vulkan memory for the preview image";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
-  if (vkBindImageMemory(device, state.destination_image,
-                        state.destination_memory, 0) != VK_SUCCESS) {
+  if (vkBindImageMemory(device, slot.destination_image, slot.destination_memory,
+                        0) != VK_SUCCESS) {
     status = "Failed to bind Vulkan memory for the preview image";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
 
   VkImageViewCreateInfo image_view_info{
       VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-  image_view_info.image = state.destination_image;
+  image_view_info.image = slot.destination_image;
   image_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
   image_view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
   image_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -695,9 +774,9 @@ static bool ensure_vulkan_preview_target_resources(
   image_view_info.subresourceRange.baseArrayLayer = 0;
   image_view_info.subresourceRange.layerCount = 1;
   if (vkCreateImageView(device, &image_view_info, nullptr,
-                        &state.destination_image_view) != VK_SUCCESS) {
+                        &slot.destination_image_view) != VK_SUCCESS) {
     status = "Failed to create the Vulkan preview destination image view";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
 
@@ -705,29 +784,29 @@ static bool ensure_vulkan_preview_target_resources(
       VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
   framebuffer_info.renderPass = state.render_pass;
   framebuffer_info.attachmentCount = 1;
-  framebuffer_info.pAttachments = &state.destination_image_view;
+  framebuffer_info.pAttachments = &slot.destination_image_view;
   framebuffer_info.width = preview_width;
   framebuffer_info.height = preview_height;
   framebuffer_info.layers = 1;
   if (vkCreateFramebuffer(device, &framebuffer_info, nullptr,
-                          &state.framebuffer) != VK_SUCCESS) {
+                          &slot.framebuffer) != VK_SUCCESS) {
     status = "Failed to create the Vulkan preview framebuffer";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
 
   VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   buffer_info.size = staging_size;
   buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-  if (vkCreateBuffer(device, &buffer_info, nullptr, &state.staging_buffer) !=
+  if (vkCreateBuffer(device, &buffer_info, nullptr, &slot.staging_buffer) !=
       VK_SUCCESS) {
     status = "Failed to create the Vulkan preview staging buffer";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
 
   VkMemoryRequirements buffer_memory_requirements;
-  vkGetBufferMemoryRequirements(device, state.staging_buffer,
+  vkGetBufferMemoryRequirements(device, slot.staging_buffer,
                                 &buffer_memory_requirements);
   uint32_t buffer_memory_type_index = 0;
   bool host_coherent = false;
@@ -737,7 +816,7 @@ static bool ensure_vulkan_preview_target_resources(
                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                buffer_memory_type_index, host_coherent)) {
     status = "Failed to find host-visible Vulkan memory for the staging buffer";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
 
@@ -746,28 +825,28 @@ static bool ensure_vulkan_preview_target_resources(
   buffer_memory_info.allocationSize = buffer_memory_requirements.size;
   buffer_memory_info.memoryTypeIndex = buffer_memory_type_index;
   if (vkAllocateMemory(device, &buffer_memory_info, nullptr,
-                       &state.staging_memory) != VK_SUCCESS) {
+                       &slot.staging_memory) != VK_SUCCESS) {
     status = "Failed to allocate Vulkan memory for the staging buffer";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
-  if (vkBindBufferMemory(device, state.staging_buffer, state.staging_memory,
+  if (vkBindBufferMemory(device, slot.staging_buffer, slot.staging_memory,
                          0) != VK_SUCCESS) {
     status = "Failed to bind Vulkan memory for the staging buffer";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
-  if (vkMapMemory(device, state.staging_memory, 0, staging_size, 0,
-                  &state.mapped_staging) != VK_SUCCESS) {
+  if (vkMapMemory(device, slot.staging_memory, 0, staging_size, 0,
+                  &slot.mapped_staging) != VK_SUCCESS) {
     status = "Failed to map the Vulkan preview staging memory";
-    destroy_vulkan_preview_target_resources(state);
+    destroy_vulkan_preview_slot_target_resources(device, slot);
     return false;
   }
 
-  state.staging_memory_coherent = host_coherent;
-  state.staging_buffer_size = staging_size;
-  state.destination_width = preview_width;
-  state.destination_height = preview_height;
+  slot.staging_memory_coherent = host_coherent;
+  slot.staging_buffer_size = staging_size;
+  slot.destination_width = preview_width;
+  slot.destination_height = preview_height;
   return true;
 }
 
@@ -1106,25 +1185,135 @@ static bool capture_opengl_preview(const PreviewCaptureRequest &request,
   return success;
 }
 
-static bool capture_vulkan_preview(const PreviewCaptureRequest &request,
-                                   TrackedPreviewImage &preview,
-                                   std::string &status) {
+static void harvest_completed_vulkan_preview_captures(XrSession session,
+                                                      bool wait_for_all) {
+  std::shared_ptr<VulkanPreviewSessionState> state =
+      get_vulkan_preview_session_state(session);
+  if (!state)
+    return;
+
+  std::vector<VulkanPreviewHarvestResult> completed;
+  {
+    std::lock_guard capture_lock(state->mutex);
+    VkDevice device = state->binding.device;
+    if (device == VK_NULL_HANDLE)
+      return;
+
+    for (auto &slot : state->slots) {
+      if (!slot.in_flight || slot.fence == VK_NULL_HANDLE)
+        continue;
+
+      VkResult fence_result = wait_for_all
+                                  ? vkWaitForFences(device, 1, &slot.fence,
+                                                    VK_TRUE, UINT64_MAX)
+                                  : vkGetFenceStatus(device, slot.fence);
+      if (!wait_for_all && fence_result == VK_NOT_READY)
+        continue;
+
+      VulkanPreviewHarvestResult result;
+      result.swapchain = slot.swapchain;
+      int64_t finalize_begin_ns = now_ns();
+
+      if (fence_result != VK_SUCCESS) {
+        result.status = "Failed to observe Vulkan preview completion fence";
+      } else {
+        if (!slot.staging_memory_coherent) {
+          VkMappedMemoryRange mapped_range{
+              VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+          mapped_range.memory = slot.staging_memory;
+          mapped_range.offset = 0;
+          mapped_range.size = slot.staging_buffer_size;
+          if (vkInvalidateMappedMemoryRanges(device, 1, &mapped_range) !=
+              VK_SUCCESS) {
+            result.status =
+                "Failed to invalidate the Vulkan preview staging memory";
+          }
+        }
+
+        if (result.status.empty()) {
+          result.preview.rgba8.resize((size_t)slot.preview_width *
+                                      (size_t)slot.preview_height * 4);
+          std::memcpy(result.preview.rgba8.data(), slot.mapped_staging,
+                      result.preview.rgba8.size());
+          result.preview.available = true;
+          result.preview.capture_serial = slot.capture_serial;
+          result.preview.image_index = slot.image_index;
+          result.preview.image_array_index = slot.image_array_index;
+          result.preview.width = slot.preview_width;
+          result.preview.height = slot.preview_height;
+          result.status = slot.image_array_index != 0
+                              ? "Captured Vulkan preview asynchronously"
+                              : "Captured Vulkan preview asynchronously";
+        }
+      }
+
+      int64_t finalize_end_ns = now_ns();
+      result.finalize_ms = ns_to_ms(finalize_begin_ns, finalize_end_ns);
+      if (slot.submit_end_ns != 0)
+        result.ready_latency_ms = ns_to_ms(slot.submit_end_ns, finalize_end_ns);
+
+      destroy_vulkan_preview_slot_submission_resources(device, slot);
+      completed.push_back(std::move(result));
+    }
+  }
+
+  for (auto &result : completed) {
+    InstanceData *data = GetInstanceDataFromSwapchain(result.swapchain);
+    if (data == nullptr)
+      continue;
+
+    std::unique_lock lock(data->state_mutex);
+    auto tracked_it = data->swapchains.find(result.swapchain);
+    if (tracked_it == data->swapchains.end())
+      continue;
+
+    TrackedSwapchain &tracked = tracked_it->second;
+    if (tracked.preview_inflight_count > 0)
+      tracked.preview_inflight_count--;
+
+    if (result.preview.available) {
+      tracked.latest_preview = result.preview;
+      tracked.preview_images[make_preview_key(result.preview.image_index,
+                                             result.preview.image_array_index)] =
+          result.preview;
+      tracked.preview_success_count++;
+    }
+
+    tracked.preview_status = result.status;
+    record_preview_timing(result.finalize_ms, tracked.preview_finalize_ms_last,
+                          tracked.preview_finalize_ms_max,
+                          tracked.preview_finalize_ms_total,
+                          tracked.preview_finalize_sample_count);
+    if (result.ready_latency_ms > 0.0f) {
+      record_preview_timing(result.ready_latency_ms,
+                            tracked.preview_ready_latency_ms_last,
+                            tracked.preview_ready_latency_ms_max,
+                            tracked.preview_ready_latency_ms_total,
+                            tracked.preview_ready_latency_sample_count);
+    }
+  }
+}
+
+static VulkanPreviewSubmitResult
+submit_vulkan_preview_capture(const PreviewCaptureRequest &request) {
+  VulkanPreviewSubmitResult result;
   std::shared_ptr<VulkanPreviewSessionState> state =
       get_vulkan_preview_session_state(request.session);
   if (!state) {
-    status =
+    result.status =
         "Vulkan preview session state was not captured from xrCreateSession";
-    return false;
+    return result;
   }
 
+  int64_t submit_begin_ns = now_ns();
   std::lock_guard capture_lock(state->mutex);
-  if (!ensure_vulkan_preview_static_resources(*state, status))
-    return false;
+  if (!ensure_vulkan_preview_static_resources(*state, result.status))
+    return result;
 
   PreviewCaptureConfig config = get_preview_capture_config();
   if (request.width == 0 || request.height == 0) {
-    status = "Swapchain extent is zero";
-    return false;
+    result.status = "Swapchain extent is zero";
+    return result;
   }
 
   uint32_t preview_width = request.width;
@@ -1136,87 +1325,89 @@ static bool capture_vulkan_preview(const PreviewCaptureRequest &request,
     preview_height = std::max(1u, (uint32_t)(preview_height * scale));
   }
 
+  VulkanPreviewCaptureSlot *slot = nullptr;
+  for (auto &candidate : state->slots) {
+    if (!candidate.in_flight) {
+      slot = &candidate;
+      break;
+    }
+  }
+  if (slot == nullptr) {
+    result.status = "All Vulkan preview capture slots are busy";
+    return result;
+  }
+
   bool recreated_target = false;
-  if (!ensure_vulkan_preview_target_resources(
-          *state, preview_width, preview_height, recreated_target, status)) {
-    return false;
+  if (!ensure_vulkan_preview_target_resources(*state, *slot, preview_width,
+                                              preview_height, recreated_target,
+                                              result.status)) {
+    return result;
   }
 
   VkImage source_image = unpack_handle<VkImage>(request.image_handle_value);
   if (source_image == VK_NULL_HANDLE) {
-    status = "Tracked Vulkan swapchain image handle is null";
-    return false;
+    result.status = "Tracked Vulkan swapchain image handle is null";
+    return result;
   }
 
   VkImageLayout source_original_layout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!infer_vulkan_source_layout(request, source_original_layout)) {
-    status = "Vulkan preview could not infer the source image layout";
-    return false;
+    result.status = "Vulkan preview could not infer the source image layout";
+    return result;
   }
 
   VkDevice device = state->binding.device;
-  VkImageView source_image_view = VK_NULL_HANDLE;
-  auto cleanup_source_image_view = [&] {
-    if (source_image_view != VK_NULL_HANDLE) {
-      vkDestroyImageView(device, source_image_view, nullptr);
-      source_image_view = VK_NULL_HANDLE;
-    }
-  };
+  destroy_vulkan_preview_slot_submission_resources(device, *slot);
 
   VkImageViewCreateInfo source_image_view_info{
       VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   source_image_view_info.image = source_image;
   source_image_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
   source_image_view_info.format = (VkFormat)request.format;
-  source_image_view_info.subresourceRange.aspectMask =
-      VK_IMAGE_ASPECT_COLOR_BIT;
+  source_image_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   source_image_view_info.subresourceRange.baseMipLevel = 0;
   source_image_view_info.subresourceRange.levelCount = 1;
   source_image_view_info.subresourceRange.baseArrayLayer = 0;
   source_image_view_info.subresourceRange.layerCount = 1;
   if (vkCreateImageView(device, &source_image_view_info, nullptr,
-                        &source_image_view) != VK_SUCCESS) {
-    status = "Failed to create the Vulkan preview source image view";
-    return false;
+                        &slot->source_image_view) != VK_SUCCESS) {
+    result.status = "Failed to create the Vulkan preview source image view";
+    destroy_vulkan_preview_slot_submission_resources(device, *slot);
+    return result;
   }
 
   VkDescriptorImageInfo descriptor_image_info{};
   descriptor_image_info.sampler = state->sampler;
-  descriptor_image_info.imageView = source_image_view;
+  descriptor_image_info.imageView = slot->source_image_view;
   descriptor_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
   VkWriteDescriptorSet descriptor_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-  descriptor_write.dstSet = state->descriptor_set;
+  descriptor_write.dstSet = slot->descriptor_set;
   descriptor_write.dstBinding = 0;
   descriptor_write.descriptorCount = 1;
   descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
   descriptor_write.pImageInfo = &descriptor_image_info;
   vkUpdateDescriptorSets(device, 1, &descriptor_write, 0, nullptr);
 
-  if (vkWaitForFences(device, 1, &state->fence, VK_TRUE, UINT64_MAX) !=
-      VK_SUCCESS) {
-    cleanup_source_image_view();
-    status = "Failed to wait for the Vulkan preview fence";
-    return false;
+  if (vkResetFences(device, 1, &slot->fence) != VK_SUCCESS) {
+    result.status = "Failed to reset the Vulkan preview fence";
+    destroy_vulkan_preview_slot_submission_resources(device, *slot);
+    return result;
   }
-  if (vkResetFences(device, 1, &state->fence) != VK_SUCCESS) {
-    cleanup_source_image_view();
-    status = "Failed to reset the Vulkan preview fence";
-    return false;
-  }
-  if (vkResetCommandBuffer(state->command_buffer, 0) != VK_SUCCESS) {
-    cleanup_source_image_view();
-    status = "Failed to reset the Vulkan preview command buffer";
-    return false;
+  if (vkResetCommandBuffer(slot->command_buffer, 0) != VK_SUCCESS) {
+    result.status = "Failed to reset the Vulkan preview command buffer";
+    destroy_vulkan_preview_slot_submission_resources(device, *slot);
+    return result;
   }
 
   VkCommandBufferBeginInfo begin_info{
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  if (vkBeginCommandBuffer(state->command_buffer, &begin_info) != VK_SUCCESS) {
-    cleanup_source_image_view();
-    status = "Failed to begin recording the Vulkan preview command buffer";
-    return false;
+  if (vkBeginCommandBuffer(slot->command_buffer, &begin_info) != VK_SUCCESS) {
+    result.status =
+        "Failed to begin recording the Vulkan preview command buffer";
+    destroy_vulkan_preview_slot_submission_resources(device, *slot);
+    return result;
   }
 
   VkImageMemoryBarrier source_to_shader_read{
@@ -1232,8 +1423,7 @@ static bool capture_vulkan_preview(const PreviewCaptureRequest &request,
   source_to_shader_read.subresourceRange.levelCount = 1;
   source_to_shader_read.subresourceRange.baseArrayLayer = 0;
   source_to_shader_read.subresourceRange.layerCount = 1;
-  vkCmdPipelineBarrier(state->command_buffer,
-                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+  vkCmdPipelineBarrier(slot->command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &source_to_shader_read);
 
@@ -1248,14 +1438,14 @@ static bool capture_vulkan_preview(const PreviewCaptureRequest &request,
                        : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   destination_to_color_attachment.newLayout =
       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  destination_to_color_attachment.image = state->destination_image;
+  destination_to_color_attachment.image = slot->destination_image;
   destination_to_color_attachment.subresourceRange.aspectMask =
       VK_IMAGE_ASPECT_COLOR_BIT;
   destination_to_color_attachment.subresourceRange.baseMipLevel = 0;
   destination_to_color_attachment.subresourceRange.levelCount = 1;
   destination_to_color_attachment.subresourceRange.baseArrayLayer = 0;
   destination_to_color_attachment.subresourceRange.layerCount = 1;
-  vkCmdPipelineBarrier(state->command_buffer,
+  vkCmdPipelineBarrier(slot->command_buffer,
                        recreated_target ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
                                         : VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
@@ -1266,31 +1456,32 @@ static bool capture_vulkan_preview(const PreviewCaptureRequest &request,
   VkRenderPassBeginInfo render_pass_begin_info{
       VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
   render_pass_begin_info.renderPass = state->render_pass;
-  render_pass_begin_info.framebuffer = state->framebuffer;
+  render_pass_begin_info.framebuffer = slot->framebuffer;
   render_pass_begin_info.renderArea.extent = {preview_width, preview_height};
   render_pass_begin_info.clearValueCount = 1;
   render_pass_begin_info.pClearValues = &clear_value;
 
-  vkCmdBeginRenderPass(state->command_buffer, &render_pass_begin_info,
+  vkCmdBeginRenderPass(slot->command_buffer, &render_pass_begin_info,
                        VK_SUBPASS_CONTENTS_INLINE);
 
   VkViewport viewport{};
   viewport.width = (float)preview_width;
   viewport.height = (float)preview_height;
   viewport.maxDepth = 1.0f;
-  vkCmdSetViewport(state->command_buffer, 0, 1, &viewport);
+  vkCmdSetViewport(slot->command_buffer, 0, 1, &viewport);
 
   VkRect2D scissor{};
   scissor.extent = {preview_width, preview_height};
-  vkCmdSetScissor(state->command_buffer, 0, 1, &scissor);
+  vkCmdSetScissor(slot->command_buffer, 0, 1, &scissor);
 
-  vkCmdBindPipeline(state->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+  vkCmdBindPipeline(slot->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     state->pipeline);
-  vkCmdBindDescriptorSets(
-      state->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-      state->pipeline_layout, 0, 1, &state->descriptor_set, 0, nullptr);
-  vkCmdDraw(state->command_buffer, 3, 1, 0, 0);
-  vkCmdEndRenderPass(state->command_buffer);
+  vkCmdBindDescriptorSets(slot->command_buffer,
+                          VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          state->pipeline_layout, 0, 1, &slot->descriptor_set,
+                          0, nullptr);
+  vkCmdDraw(slot->command_buffer, 3, 1, 0, 0);
+  vkCmdEndRenderPass(slot->command_buffer);
 
   VkImageMemoryBarrier destination_to_transfer_src{
       VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1300,14 +1491,14 @@ static bool capture_vulkan_preview(const PreviewCaptureRequest &request,
   destination_to_transfer_src.oldLayout =
       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   destination_to_transfer_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-  destination_to_transfer_src.image = state->destination_image;
+  destination_to_transfer_src.image = slot->destination_image;
   destination_to_transfer_src.subresourceRange.aspectMask =
       VK_IMAGE_ASPECT_COLOR_BIT;
   destination_to_transfer_src.subresourceRange.baseMipLevel = 0;
   destination_to_transfer_src.subresourceRange.levelCount = 1;
   destination_to_transfer_src.subresourceRange.baseArrayLayer = 0;
   destination_to_transfer_src.subresourceRange.layerCount = 1;
-  vkCmdPipelineBarrier(state->command_buffer,
+  vkCmdPipelineBarrier(slot->command_buffer,
                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &destination_to_transfer_src);
@@ -1323,7 +1514,7 @@ static bool capture_vulkan_preview(const PreviewCaptureRequest &request,
   source_restore.subresourceRange.levelCount = 1;
   source_restore.subresourceRange.baseArrayLayer = 0;
   source_restore.subresourceRange.layerCount = 1;
-  vkCmdPipelineBarrier(state->command_buffer,
+  vkCmdPipelineBarrier(slot->command_buffer,
                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &source_restore);
@@ -1334,69 +1525,53 @@ static bool capture_vulkan_preview(const PreviewCaptureRequest &request,
   copy_region.imageSubresource.baseArrayLayer = 0;
   copy_region.imageSubresource.layerCount = 1;
   copy_region.imageExtent = {preview_width, preview_height, 1};
-  vkCmdCopyImageToBuffer(state->command_buffer, state->destination_image,
+  vkCmdCopyImageToBuffer(slot->command_buffer, slot->destination_image,
                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         state->staging_buffer, 1, &copy_region);
+                         slot->staging_buffer, 1, &copy_region);
 
   VkBufferMemoryBarrier buffer_to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
   buffer_to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   buffer_to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-  buffer_to_host.buffer = state->staging_buffer;
+  buffer_to_host.buffer = slot->staging_buffer;
   buffer_to_host.offset = 0;
-  buffer_to_host.size = state->staging_buffer_size;
-  vkCmdPipelineBarrier(state->command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+  buffer_to_host.size = slot->staging_buffer_size;
+  vkCmdPipelineBarrier(slot->command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
                        &buffer_to_host, 0, nullptr);
 
-  if (vkEndCommandBuffer(state->command_buffer) != VK_SUCCESS) {
-    cleanup_source_image_view();
-    status = "Failed to end the Vulkan preview command buffer";
-    return false;
+  if (vkEndCommandBuffer(slot->command_buffer) != VK_SUCCESS) {
+    result.status = "Failed to end the Vulkan preview command buffer";
+    destroy_vulkan_preview_slot_submission_resources(device, *slot);
+    return result;
   }
 
   VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   submit_info.commandBufferCount = 1;
-  submit_info.pCommandBuffers = &state->command_buffer;
-  if (vkQueueSubmit(state->queue, 1, &submit_info, state->fence) !=
+  submit_info.pCommandBuffers = &slot->command_buffer;
+  if (vkQueueSubmit(state->queue, 1, &submit_info, slot->fence) !=
       VK_SUCCESS) {
-    cleanup_source_image_view();
-    status = "Failed to submit the Vulkan preview commands";
-    return false;
-  }
-  if (vkWaitForFences(device, 1, &state->fence, VK_TRUE, UINT64_MAX) !=
-      VK_SUCCESS) {
-    cleanup_source_image_view();
-    status = "Failed to wait for the submitted Vulkan preview commands";
-    return false;
+    result.status = "Failed to submit the Vulkan preview commands";
+    destroy_vulkan_preview_slot_submission_resources(device, *slot);
+    return result;
   }
 
-  if (!state->staging_memory_coherent) {
-    VkMappedMemoryRange mapped_range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
-    mapped_range.memory = state->staging_memory;
-    mapped_range.offset = 0;
-    mapped_range.size = state->staging_buffer_size;
-    if (vkInvalidateMappedMemoryRanges(device, 1, &mapped_range) !=
-        VK_SUCCESS) {
-      cleanup_source_image_view();
-      status = "Failed to invalidate the Vulkan preview staging memory";
-      return false;
-    }
-  }
+  int64_t submit_end_ns = now_ns();
+  slot->in_flight = true;
+  slot->swapchain = request.swapchain;
+  slot->image_index = request.image_index;
+  slot->image_array_index = 0;
+  slot->capture_serial = request.release_serial + 1;
+  slot->preview_width = preview_width;
+  slot->preview_height = preview_height;
+  slot->submit_begin_ns = submit_begin_ns;
+  slot->submit_end_ns = submit_end_ns;
 
-  preview.rgba8.resize((size_t)preview_width * (size_t)preview_height * 4);
-  std::memcpy(preview.rgba8.data(), state->mapped_staging,
-              preview.rgba8.size());
-  preview.available = true;
-  preview.capture_serial = request.release_serial + 1;
-  preview.image_index = request.image_index;
-  preview.image_array_index = 0;
-  preview.width = preview_width;
-  preview.height = preview_height;
-  status = request.array_size > 1 ? "Captured Vulkan preview from array layer 0"
-                                  : "Captured Vulkan preview";
-
-  cleanup_source_image_view();
-  return true;
+  result.submitted = true;
+  result.app_thread_ms = ns_to_ms(submit_begin_ns, submit_end_ns);
+  result.status = request.array_size > 1
+                      ? "Submitted Vulkan preview capture from array layer 0"
+                      : "Submitted Vulkan preview capture";
+  return result;
 }
 
 static TrackedSwapchainImage
@@ -1871,36 +2046,49 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
   std::string preview_status;
   bool has_captured_preview = false;
   bool attempted_preview_capture = false;
+  float preview_app_thread_ms = 0.0f;
+  bool have_request = false;
   {
     std::shared_lock lock(data->state_mutex);
-    if (build_preview_capture_request(data, swapchain, request)) {
-      const char *skip_reason = nullptr;
-      switch (request.graphics_binding) {
-      case TrackedSession::GraphicsBindingKind::OPENGL:
-        skip_reason = preview_capture_skip_reason_opengl(request);
-        if (skip_reason == nullptr) {
-          attempted_preview_capture = true;
-          has_captured_preview =
-              capture_opengl_preview(request, captured_preview, preview_status);
-        }
-        break;
-      case TrackedSession::GraphicsBindingKind::VULKAN:
-        skip_reason = preview_capture_skip_reason_vulkan(request);
-        if (skip_reason == nullptr) {
-          attempted_preview_capture = true;
-          has_captured_preview =
-              capture_vulkan_preview(request, captured_preview, preview_status);
-        }
-        break;
-      default:
-        skip_reason =
-            "Session graphics binding is not supported for preview capture";
-        break;
-      }
+    have_request = build_preview_capture_request(data, swapchain, request);
+  }
 
-      if (skip_reason != nullptr)
-        preview_status = skip_reason;
+  if (have_request && request.graphics_binding ==
+                          TrackedSession::GraphicsBindingKind::VULKAN) {
+    harvest_completed_vulkan_preview_captures(request.session, false);
+  }
+
+  if (have_request) {
+    const char *skip_reason = nullptr;
+    switch (request.graphics_binding) {
+    case TrackedSession::GraphicsBindingKind::OPENGL:
+      skip_reason = preview_capture_skip_reason_opengl(request);
+      if (skip_reason == nullptr) {
+        int64_t capture_begin_ns = now_ns();
+        attempted_preview_capture = true;
+        has_captured_preview =
+            capture_opengl_preview(request, captured_preview, preview_status);
+        preview_app_thread_ms = ns_to_ms(capture_begin_ns, now_ns());
+      }
+      break;
+    case TrackedSession::GraphicsBindingKind::VULKAN:
+      skip_reason = preview_capture_skip_reason_vulkan(request);
+      if (skip_reason == nullptr) {
+        VulkanPreviewSubmitResult submit_result =
+            submit_vulkan_preview_capture(request);
+        attempted_preview_capture = submit_result.submitted;
+        preview_app_thread_ms = submit_result.app_thread_ms;
+        preview_status = submit_result.status;
+      }
+      break;
+    default:
+      skip_reason =
+          "Session graphics binding is not supported for preview capture";
+      break;
     }
+
+    if (skip_reason != nullptr)
+      preview_status = skip_reason;
   }
 
   int64_t t0 = now_ns();
@@ -1932,6 +2120,20 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
         tracked.preview_attempt_count++;
         if (has_captured_preview)
           tracked.preview_success_count++;
+        if (preview_app_thread_ms > 0.0f) {
+          record_preview_timing(
+              preview_app_thread_ms, tracked.preview_app_thread_ms_last,
+              tracked.preview_app_thread_ms_max,
+              tracked.preview_app_thread_ms_total,
+              tracked.preview_app_thread_sample_count);
+        }
+        if (request.graphics_binding ==
+            TrackedSession::GraphicsBindingKind::VULKAN) {
+          tracked.preview_inflight_count++;
+          tracked.preview_inflight_peak =
+              std::max(tracked.preview_inflight_peak,
+                       tracked.preview_inflight_count);
+        }
       } else {
         tracked.preview_skip_count++;
       }
@@ -1966,8 +2168,13 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
             << (uint64_t)tracked.session << std::dec
             << " attempts=" << tracked.preview_attempt_count
             << " success=" << tracked.preview_success_count
-            << " skipped=" << tracked.preview_skip_count << " status=\""
-            << tracked.preview_status << "\"";
+            << " skipped=" << tracked.preview_skip_count
+            << " inflight=" << tracked.preview_inflight_count << "/"
+            << tracked.preview_inflight_peak
+            << " app_ms=" << tracked.preview_app_thread_ms_last
+            << " finalize_ms=" << tracked.preview_finalize_ms_last
+            << " ready_ms=" << tracked.preview_ready_latency_ms_last
+            << " status=\"" << tracked.preview_status << "\"";
         preview_log_line = oss.str();
       }
     }
@@ -1980,6 +2187,11 @@ XrResult XRAPI_CALL Layer_xrReleaseSwapchainImage(
     lock.unlock();
     if (!preview_log_line.empty())
       std::cout << preview_log_line << std::endl;
+  }
+
+  if (have_request && request.graphics_binding ==
+                          TrackedSession::GraphicsBindingKind::VULKAN) {
+    harvest_completed_vulkan_preview_captures(request.session, false);
   }
   return result;
 }

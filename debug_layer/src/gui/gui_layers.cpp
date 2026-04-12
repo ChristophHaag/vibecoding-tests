@@ -95,6 +95,10 @@ static void format_handle(char *buffer, size_t buffer_size, uint64_t handle) {
   std::snprintf(buffer, buffer_size, "0x%llx", (unsigned long long)handle);
 }
 
+static float preview_avg_ms(double total_ms, uint64_t sample_count) {
+  return sample_count == 0 ? 0.0f : (float)(total_ms / (double)sample_count);
+}
+
 static const char *space_label(const InstanceData *data, XrSpace space,
                                char *fallback, size_t fallback_size) {
   if (space == XR_NULL_HANDLE)
@@ -412,6 +416,25 @@ static void render_sub_image(const InstanceData *data, const char *heading,
                 (unsigned long long)swapchain->preview_attempt_count,
                 (unsigned long long)swapchain->preview_success_count,
                 (unsigned long long)swapchain->preview_skip_count);
+    ImGui::Text(
+      "Preview timing: app-thread %.3f / %.3f / %.3f ms (last/avg/max)",
+      swapchain->preview_app_thread_ms_last,
+      preview_avg_ms(swapchain->preview_app_thread_ms_total,
+               swapchain->preview_app_thread_sample_count),
+      swapchain->preview_app_thread_ms_max);
+    ImGui::Text(
+      "Preview finalize: %.3f / %.3f / %.3f ms   latency: %.3f / %.3f / %.3f ms",
+      swapchain->preview_finalize_ms_last,
+      preview_avg_ms(swapchain->preview_finalize_ms_total,
+               swapchain->preview_finalize_sample_count),
+      swapchain->preview_finalize_ms_max,
+      swapchain->preview_ready_latency_ms_last,
+      preview_avg_ms(swapchain->preview_ready_latency_ms_total,
+               swapchain->preview_ready_latency_sample_count),
+      swapchain->preview_ready_latency_ms_max);
+    ImGui::Text("Preview in-flight: %u current  %u peak",
+          swapchain->preview_inflight_count,
+          swapchain->preview_inflight_peak);
   } else {
     ImGui::TextDisabled("Swapchain metadata not tracked yet");
   }
