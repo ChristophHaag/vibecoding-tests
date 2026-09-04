@@ -60,9 +60,52 @@ The active OpenXR runtime is expected to point at Monado's generated manifest:
 monado/build/openxr_monado-dev.json -> ~/.config/openxr/1/active_runtime.json
 ```
 
+## Test scripts (`scripts/`)
+
+Use the scripts for reproducible setup/teardown instead of ad-hoc shell
+pipelines. They detach everything into its own session (`setsid`), wait on
+readiness with bounded timeouts, and fail loudly:
+
+```sh
+bash scripts/service-down.sh                        # stop everything (safe when idle)
+bash scripts/service-up.sh [/tmp/monado.log]        # start service, wait for port 4242
+bash scripts/hello-up.sh [/tmp/hello.log]           # start hello_xr, wait for swapchains
+bash scripts/playground-up.sh [/tmp/playground.log] # start playground, wait for FOCUSED
+bash scripts/capture-heavy-warp.sh 0 0.03 6 0.4 /tmp/ab 25  # head-motion burst + settled fresh ref
+python3 scripts/analyze-warp.py warped.png fresh.png --crop x,y,w,h  # FFT-aligned halo/missing metrics as JSON
+```
+
+- Always `service-down` first: a previous service can linger in teardown
+  while still holding port 4242, and the next instance then dies with
+  `ERROR [setup_accept_fd] bind: -1`. The script SIGTERMs, escalates to
+  SIGKILL, removes `/run/user/1000/monado.pid`, and reports leftovers.
+- `pkill -x openxr-playground` does NOT work (comm truncates to 15 chars);
+  the script matches the build-tree path instead. Same for any `pgrep -c`
+  singularity check — match the path, not the short name.
+- Known Monado issue (do not try to fix it in passing): freezing an app
+  at the wrong moment of its frame cycle makes frame pacing schedule the
+  next `xrWaitFrame` after resume for a very long time, so the app looks
+  wedged and recovers only slowly. After any freeze, allow a long settle
+  (tens of seconds) and check the app log for session-state progress
+  before concluding the app, the warp, or the service is stuck.
+- Any `pkill`/`pgrep -f <pattern>` MUST use the bracket trick
+  (e.g. `[o]penxr-playground`, `pg-stdin-holde[r]`): the pattern otherwise
+  matches the calling shell's own command line and the script SIGTERMs or
+  SIGSTOPs itself (this has happened more than once — a frozen shell that
+  times out instead of a clean kill).
+- Use a fresh log file per run; concurrent runs appending to one log are
+  unreadable. The scripts truncate the log they are given.
+- Do not launch apps with direct `... &` background pipelines: the harness
+  waits on the pipe and the call times out (the app may survive, or be
+  killed with the group — either way it is unobservable). The scripts
+  return immediately after detaching.
+
 ## Test apps
 
-`hello_xr` and `openxr-playground` should both get a live stdin pipe so they do not exit immediately on EOF:
+`hello_xr` needs a live stdin pipe (it exits on stdin EOF);
+`openxr-playground` stalls early in setup on EOF stdin (it blocks, it does
+not exit). The scripts provide a blocking stdin holder for both — do not
+redirect app stdin from `/dev/null`.
 
 ```sh
 (sleep infinity) | stdbuf -oL -eL hello_xr -G Vulkan2
@@ -72,19 +115,56 @@ monado/build/openxr_monado-dev.json -> ~/.config/openxr/1/active_runtime.json
 Useful readiness checks:
 
 ```sh
-until grep -q "Creating swapchain for view 1" /tmp/hello_xr.log 2>/dev/null; do sleep 0.2; done
+until grep -q "swapchain for view 1" /tmp/hello_xr.log 2>/dev/null; do sleep 0.2; done
 until grep -q "state changed from 4 to 5" /tmp/playground.log 2>/dev/null; do sleep 0.2; done
 ```
 
 - `hello_xr` going quiet after startup is normal; it does not log per-frame activity.
 - `openxr-playground` needs `DISPLAY` and reaches usable input state at session state `5` (`FOCUSED`).
-- When redirecting app output to a log file, prefer `stdbuf -oL -eL` so readiness checks observe lines promptly instead of waiting on stdio buffering.
+- When redirecting app output to a log file, `stdbuf -oL -eL` is REQUIRED,
+  not optional: without it the playground's output sits in a 4–8 KB stdio
+  buffer and the log looks frozen at `Using preferred swapchain format`
+  while the app is actually running fine. (This exact misread cost a full
+  debugging session.)
+- Playground env knobs (test hooks in `main.cpp`, see
+  `openxr-simple-playground/AGENTS.md`): `PLAYGROUND_NO_QUAD=1` submits only
+  the projection(+depth) layer so the compositor takes the single-layer
+  fast path (required for the openwarp depth warp);
+  `PLAYGROUND_NO_QUIT=1` ignores SDL_QUIT so runs survive;
+  `PLAYGROUND_FRAME_MS` paces frames (default 50; the stock `sleep(1.5)`
+  makes ~0.66 fps).
 
 ## End-to-end testing
 
 - After changing any runnable subproject or its build/runtime wiring, prefer an end-to-end smoke test on live Monado before finishing.
 - Build only the subproject you changed, then run one canonical test path instead of inventing a new ad hoc sequence.
 - Keep logs in `/tmp` and clean up the app and Monado processes before you stop.
+
+### Seeing the compositor output
+
+The compositor opens a `Monado` XCB window (e.g. 960x540 side-by-side
+eyes) showing the distorted output. Screenshot it any time:
+
+```sh
+import -window "Monado" /tmp/shot.png
+```
+
+This closes the loop for rendering-path work: keep the app alive but
+stale (`PLAYGROUND_FRAME_MS=100..1000`, so every submitted frame lags its
+warp pose by up to the frame interval), move the head with the remote
+client (`head …`, `send`), and screenshot mid-motion — then hold the final
+pose, let fresh frames settle, and compare with `analyze-warp.py`
+(same-pose warped-vs-fresh, FFT-aligned halo/missing metrics — no
+eyeballing screenshots). Full methodology is documented in
+`monado/doc/openwarp_integration.md` §8.
+
+Do NOT use `kill -STOP` on the app to pin the render pose: the compositor
+only presents on client commits, so a frozen client means a frozen mirror
+(verified: 30 s dwell through 0.3 m + 20° motion, zero pixels changed) —
+and freezing risks Monado's known frame-pacing stall (below), which then
+masquerades as a warp bug. If screenshots stop updating, restart fresh
+(`service-down`/`service-up`/`hello-up`/`playground-up`) instead of
+freeze/thaw cycles.
 
 Canonical remote-driver-client smoke test:
 
@@ -101,7 +181,7 @@ until grep -q "Listening on port '4242'" /tmp/monado-e2e.log 2>/dev/null; do sle
 (sleep infinity) | stdbuf -oL -eL hello_xr -G Vulkan2 \
 	> /tmp/hello_xr-e2e.log 2>&1 &
 APP_PID=$!
-until grep -q "Creating swapchain for view 1" /tmp/hello_xr-e2e.log 2>/dev/null; do sleep 0.2; done
+until grep -q "swapchain for view 1" /tmp/hello_xr-e2e.log 2>/dev/null; do sleep 0.2; done
 
 printf 'state\nhead 0 1.7 0 0 0 0 1\nsend\nquit\n' | \
 	remote-driver-client/build/monado-remote-client
@@ -113,12 +193,12 @@ wait $APP_PID $MONADO_PID 2>/dev/null || true
 Success signals from the tested path:
 
 - Monado log: `Config selected remote` and `Listening on port '4242'`.
-- App log: `Creating swapchain for view 1`.
+- App log: `swapchain for view 1` (hello_xr prints `Creating color and depth swapchain for view 1`).
 - Remote client: `Connected.`, `Ready.`, JSON state output, then `ok` for `state`, `head`, and `send`.
 
 ## Are frames actually reaching the compositor? — diagnostic recipe
 
-The canonical smoke test only checks that the app *connects* (`Creating swapchain
+The canonical smoke test only checks that the app *connects* (`swapchain
 for view 1`, `state changed from 4 to 5`) and that Monado *starts up*
 (`Config selected remote`, `Listening on port '4242'`). It does **not** verify
 that the compositor actually renders a frame. An app can reach `FOCUSED` and
@@ -175,11 +255,14 @@ Then check, in order:
 2. **GL/VK interop sync at xrEndFrame**: in the *app* log, grep for
    `ipc_call_compositor_layer_sync_with_semaphore failed: XRT_ERROR_IPC_FAILURE`
    or `ipc_call_space_locate_device failed: XRT_ERROR_IPC_FAILURE`. If present,
-   the GL↔Vulkan swapchain sync (semaphore) is broken in this environment and
-   the layer commit never reaches the server. The app will still report
-   `FOCUSED` and its own window will keep animating, but Monado's compositor
-   renders nothing. This is a known sandbox limitation with no real fix from
-   the compositor side; verify on hardware with working GL/VK interop.
+   the GL↔Vulkan swapchain sync (semaphore) is broken and the layer commit
+   never reaches the server. The app will still report `FOCUSED` and its own
+   window will keep animating, but Monado's compositor renders nothing. This
+   failure was seen historically with the OpenGL playground in this sandbox,
+   but current builds submit cleanly (verified: thousands of playground
+   frames, zero such failures) — so if it appears now, suspect a regression
+   or a wedged service (run `service-down`/`service-up`) rather than a
+   permanent environment limitation.
 
 3. **Server receives the commit**: in the Monado log, `LAYER_COMMIT` at SPEW
    level (set `XRT_COMPOSITOR_LOG=trace`) or a temporary `U_LOG_I` at the top of

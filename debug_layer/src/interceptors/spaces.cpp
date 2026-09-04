@@ -4,6 +4,7 @@
 #include "../dispatch.h"
 #include "../instance_data.h"
 
+#include <cmath>
 #include <ctime>
 #include <iostream>
 #include <string>
@@ -163,6 +164,19 @@ XrResult XRAPI_CALL Layer_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime
         }
     }
 
+    static bool dump_enabled = std::getenv("XR_DEBUG_GUI_DUMP_SPACES") != nullptr;
+    if (dump_enabled && XR_SUCCEEDED(result) && location != nullptr) {
+        XrPosef p = location->pose;
+        bool pos_valid =
+            (location->locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+        bool orient_valid =
+            (location->locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
+        std::cout << "[locate] space=" << (void *)space << " base=" << (void *)baseSpace
+                  << " pos=(" << p.position.x << "," << p.position.y << "," << p.position.z
+                  << ")" << " flags=" << (int)location->locationFlags
+                  << " pv=" << pos_valid << " ov=" << orient_valid << std::endl;
+    }
+
     return result;
 }
 
@@ -209,6 +223,21 @@ XrResult XRAPI_CALL Layer_xrLocateViews(XrSession session,
         if (data->perf.has_current) {
             data->perf.current.locate_views_call_ts = t0;
             data->perf.current.locate_views_return_ts = t1;
+        }
+
+        static bool dump_enabled = std::getenv("XR_DEBUG_GUI_DUMP_VIEWS") != nullptr;
+        if (dump_enabled && count > 0) {
+            static XrVector3f last_pos{NAN, NAN, NAN};
+            XrVector3f p = views[0].pose.position;
+            bool changed =
+                std::isnan(last_pos.x) || std::fabs(p.x - last_pos.x) > 1e-4f ||
+                std::fabs(p.y - last_pos.y) > 1e-4f || std::fabs(p.z - last_pos.z) > 1e-4f;
+            if (changed) {
+                std::cout << "[view0] t=" << viewLocateInfo->displayTime
+                          << " pos=(" << p.x << "," << p.y << "," << p.z << ")"
+                          << " flags=" << (int)viewState->viewStateFlags << std::endl;
+                last_pos = p;
+            }
         }
     }
 
