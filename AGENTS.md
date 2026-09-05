@@ -166,6 +166,146 @@ masquerades as a warp bug. If screenshots stop updating, restart fresh
 (`service-down`/`service-up`/`hello-up`/`playground-up`) instead of
 freeze/thaw cycles.
 
+- A mirror that stays bit-identical across head moves (same md5 at
+  different poses) with the app `FOCUSED` is a wedged session, not a
+  perfect warp. `kill -9` on the playground without restarting the
+  service wedges the replacement app instance in `xrWaitFrame` (0 CPU
+  time, no new commits). Always `service-down`/`service-up` together
+  with an app restart after a `kill -9`, then re-verify with one head
+  move + screenshot md5 change before measuring anything.
+
+### Catching a stale-warped frame (timing matters more than slowness)
+
+A single head jump usually does NOT produce a stale-source frame: the
+screenshot right after the move still shows the old frame, and by the
+next compositor update the app has already re-rendered at the new pose
+(fresh). To catch the interesting frame — stale source reprojected to
+the new warp pose — use a fast loop (`PLAYGROUND_FRAME_MS=50` or less,
+many tries per run) and this exact sequence per try: app submits →
+app sleeps → `head X …` + `send` → screenshot ~one frame interval later
+(~0.07 s at 50 ms pacing). Alternate two poses (e.g. 0 ↔ 0.3 m) and
+repeat 8+ times; only tries landing in the app's sleep window go stale.
+Very slow loops (1000+ ms) are the wrong tool here: every jump resolves
+to fresh. Confirmed example pair: `repro_double_warped.png` (stale)
+vs `repro_double_fresh.png` (same pose, settled).
+
+The valid artifact pair is same-pose: the first new frame after a move
+versus a settled frame at that same head pose seconds later. Comparing
+a mid-motion frame against fresh at a *different* pose measures
+parallax, not warp error.
+
+### Fast closed-loop stale capture (scripted, seconds not minutes)
+
+Blind volume does not work: `import` with PNG encode (~4/s) cannot hit
+the ~50 ms stale window, and hundreds of 5 s-spaced screenshots are all
+fresh by construction. Use `scripts/capture-stale-hunt.py` instead: one
+persistent remote-client connection alternating two absolute head quats,
+dense `import -window Monado -depth 8 rgb:-` grabs on stdout (~25 ms/shot,
+raw RGB parse in-process, PNG encode only for hits) with in-process numpy
+scoring and stop-on-hit. Plain XGetImage capture (`xwd`, `scrot`,
+`xwd -root`) fails server-wide in this sandbox (BadMatch) — do not
+"fix" the script back to xwd. Proven: green-hand blackout hit 1.6 s
+after staging (2 rounds), plus an auto-captured same-pose fresh frame
+5 s later.
+
+Facts that make it fast (all verified, all previously misread):
+
+- Pose delivery is one frame or faster, not seconds. The "lag" was a
+  coarse-polling artifact: 5–30 s polls cannot resolve sub-second
+  delivery (a back-to-back burst shows the pre-delivery frame
+  md5-identical to fresh, the next captures already transitioning, full
+  visual settle ~0.15 s after `send`). Never sleep 25–45 s
+  to "settle" — ~10–15 s suffices.
+- `r_hub.c` applies `r->latest` on packet receipt and `r_hmd` returns it
+  unfiltered: there is no server-side pose queue. Per-command TCP
+  reconnects (one `monado-remote-client` per `send`) only cost ms, but
+  the persistent connection in the script removes even that.
+- Do NOT slow the app to widen the window: `PLAYGROUND_FRAME_MS >= 100`
+  wedges the app in this sandbox (0% CPU, stuck in `do_wait`, zero
+  submits; the mirror then only warp-only updates a frozen frame —
+  spectacular but meaningless blackouts). Hunt at default 50 ms pacing.
+- Target hands, not the cube: the cube (small, ~2 m, low parallax)
+  reprojects cleanly in-frame in live mode (~1200 captures, always
+  intact); stale windows only bite near geometry. Big jumps just push
+  the cube out of view (legitimate clipping, not a bug).
+
+Recipe: stage pitch −10° (both hands + cube in frame with margins),
+wait ~15 s, hunt yaw ±20° at that pitch:
+
+```sh
+printf 'head 0 1.7 0 -0.0872 0 0 0.9962\nsend\nquit\n' | \
+	remote-driver-client/build/monado-remote-client
+sleep 15
+python3 scripts/capture-stale-hunt.py \
+	-0.0859 0.1729 0.0151 0.9811 -0.0859 -0.1729 -0.0151 0.9811 \
+	--out /tmp/hunt1
+```
+
+Hit signature: green pixels collapse (<50% of staged baseline) while
+pink stays in view (>25% of baseline total) — green-hand body black
+with only the outline surviving, pink hand + cube intact. The script
+prints `HIT <png> dt=<s> elapsed=<s>` + `FRESH <png>` (exit 0), or
+`MISS ...` with the best near-miss (exit 1).
+
+### Numeric ghost/double detection (no eyeballing)
+
+Count pink/green hand-joint pixels per eye (pink: R>200, G/B 80–180;
+green: G>200, R/B 80–180). A double view shows counts far above the
+settled baseline at the same pose (verified case: 3281 vs 1768 green,
+~1.8x). A chamfer histogram of warped-only mask pixels to the fresh
+mask then tells rim from copy: a thin 1 px peak is filtering residue,
+while a second mass ≥20 px away sitting at the old head-pose position
+(verified: 125 px offset for 0.3 m on close joints) is a stale second
+copy.
+
+Confounders that fake a signal: the scene cubes spin at 0.25 rot/s, so
+same-pose frames seconds apart differ by object motion, and spinning
+occlusion swings joint counts by ±1400 at identical head poses. Only
+trust count deltas on static geometry over short windows — and distrust
+slow-loop "identical" pairs, since 1 s intervals land on 90°-symmetric
+cube orientations and hide rotation entirely.
+
+### Attributing a black region (which warp stage dropped it)
+
+Run the service with openwarp debug knobs (all `MONADO_OPENWARP_*` env
+on `monado-service`, parsed in `comp_compositor.c:84-97`) and re-capture
+the same stale pose:
+
+- `MONADO_OPENWARP_SHOW_OCCLUSION=1` tints pixels where the occlusion
+  test fired (`z_src < 0.95 * z_warp`: a nearer source texel covers this
+  warp pixel).
+- `MONADO_OPENWARP_SHOW_STRETCH=1` tints pixels filled by the
+  stretch/disocclusion fill.
+- `MONADO_OPENWARP_DEPTH_AS_COLOR=1` shows warp depth instead of color:
+  magenta holes = no splat arrived at all; valid background-looking
+  depth = the background splat legitimately won.
+- `MONADO_OPENWARP_DISABLE_OCCLUSION=1` /
+  `MONADO_OPENWARP_DISABLE_STRETCH=1` bisect which stage causes it.
+- `MONADO_OPENWARP_FREEZE_SOURCE=1` (`comp_renderer.c:1277`) freezes the
+  source frame while the warp pose keeps tracking: deterministic stale
+  source on demand, no timing luck needed. Attribution tool only — a
+  frozen source is not a live app.
+
+Decision tree for a black patch with the scene otherwise intact:
+
+1. Occlusion overlay magenta there → a near source texel covers it.
+   Check whether that occluder is real at the *source* pose (compare the
+   same-pose fresh frame). If yes, the warp is honest; if the occluder
+   is itself stale data, the source is older than you think.
+2. Stretch overlay green there → disocclusion fill ran: the warp pixel
+   had no valid source sample (revealed side / out-of-frame data).
+3. Neither flag, depth-as-color shows valid background depth → the
+   background splat won and no foreground splat arrived (the pose pair
+   has no foreground coverage there — e.g. a rotation-revealed side
+   that was hidden in the source view).
+4. Depth-as-color shows a magenta hole → nothing splatted there at all
+   (no source data: out of frustum in the source frame).
+
+In all four cases the verdict needs the same-pose fresh frame
+(`capture-stale-hunt.py` saves both): a black patch that is also
+black/geometrically absent in fresh is scene truth or honest
+out-of-data, not a warp bug.
+
 Canonical remote-driver-client smoke test:
 
 ```sh
@@ -353,6 +493,59 @@ playground reached `FOCUSED`). Note: this same run produced 1 validation
 compute target's `rtr` array / swapchain images not being fully freed in this
 sandbox's teardown path. It is unrelated to the per-frame openwarp path and
 does not block the per-frame verification gates above.
+
+## Agent time-traps (symptom → correct signal)
+
+Every one of these cost a session. Check this list before concluding
+anything about poses, frames, or the warp:
+
+1. **Coarse polls fake latency.** `sleep 5` + screenshot cannot resolve
+   sub-second pose delivery; the first post-`send` capture is already
+   transitioning (verified with a dense burst: pre-delivery frame
+   md5-identical to fresh, full settle ~0.15 s). Never sleep 25–45 s to
+   "settle" — ~10–15 s max, then hunt with `capture-stale-hunt.py`.
+2. **Static mirror ≠ wedged app.** With a static head and static scene
+   the mirror is *supposed* to be bit-identical across screenshots.
+   Liveness signal: two shots at a 90°-asymmetric cube interval (1.3 s,
+   not 1/3/10 s — the cubes spin at 0.25 rot/s, so integer seconds land
+   on symmetric orientations and hide rotation entirely), or one head
+   move + dense polling.
+3. **FOCUSED ≠ frames render.** Session state 5 only means the session
+   runs; use the "Are frames actually reaching the compositor?" recipe
+   before trusting any rendering conclusion.
+4. **`import` with PNG encode cannot catch stale windows.** ~4/s vs a
+   ~50 ms stale window at default pacing. Use `import -window Monado
+   -depth 8 rgb:-` to stdout (~25 ms/shot) + in-process numpy parse (see
+   `scripts/capture-stale-hunt.py`). Plain XGetImage (`xwd`, `scrot`)
+   fails server-wide here (BadMatch). Convert to PNG only for hits.
+5. **Evenly spaced screenshots are fresh by construction.** The app
+   resubmits ~100× between 5 s-spaced shots at 50 ms pacing. Hunt
+   closed-loop (dense captures + realtime score + stop-on-hit), don't
+   sweep blindly and rank later.
+6. **Do not slow the app.** `PLAYGROUND_FRAME_MS >= 100` wedges it in
+   this sandbox (0% CPU, stuck in `do_wait`, zero submits; the mirror
+   then only warp-only updates a frozen frame — spectacular but
+   meaningless blackouts). Hunt at default 50 ms pacing.
+7. **Zero color pixels ≠ blackout.** The usual cause is the object out
+   of view (legitimate clipping). Gate on hands-present (pink+green
+   joint counts near baseline) before ranking cube counts, then eyeball
+   the winners.
+8. **Different-pose comparisons measure parallax, not warp error.** Only
+   same-pose stale-vs-fresh pairs count (the hunt script saves both).
+9. **One `monado-remote-client` per `send` churns TCP.** A persistent
+   connection (stdin pipe, read the `ok`s — see the hunt script's `RC`
+   class) lets you alternate poses every ~2 s with no reconnects.
+10. **Whole-object blackout with surviving outlines = occlusion false
+    positives, not missing splats.** Symptom: an object's body goes black
+    while its silhouette stays colored (verified: green hand after a yaw
+    jump). The stale-foreground check compared source depth against the
+    *warp* view-depth, but head rotation swings each eye several cm, so
+    same-surface interiors misread as occluded. Bisect with
+    `MONADO_OPENWARP_DISABLE_OCCLUSION=1` (blackout vanishes → the check
+    is the killer), fix by comparing against the point's own render-view
+    depth (`renderV` in the openwarp UBO, `source_visible()` in
+    `openwarp.comp`). Outlines survive because edge depth filtering
+    pushes their source depth farther, so they pass the bad check.
 
 ## Keep instructions current
 
