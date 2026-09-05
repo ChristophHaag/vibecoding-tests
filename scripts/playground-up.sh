@@ -5,7 +5,9 @@
 #
 # Usage: bash scripts/playground-up.sh [logfile]
 # Env:   PLAYGROUND_NO_QUAD (default 1: single projection layer, so the
-#          compositor takes the single-layer fast path incl. openwarp),
+#          compositor takes the single-layer fast path incl. openwarp;
+#          unset it entirely to submit the quad too — the compute
+#          openwarp path composites it via its quad overlay pass),
 #        PLAYGROUND_FRAME_MS (default 50: per-frame pacing; the test hook
 #          replaces the stock sleep(1.5)).
 # Exit non-zero if FOCUSED is not reached within 90 s.
