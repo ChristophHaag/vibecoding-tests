@@ -1115,6 +1115,37 @@ equivalents noted where they exist.
 - **`XrSpaceWarp` sample** — Oculus native sample app; known-good
   MV/depth generator for validating a future implementation.
 
+## 2026-09-06 follow-up: fidelity-plan item 3 (depth-convention matrix) — done, one limitation found
+
+`scripts/owdepth-conventions.py`: float32 ports of all three
+linearization copies (splat + mesh-vert `convert_app_depth_to_warp_ndc`,
+reproject `app_depth_to_eye_z`) over 400 near/far/min/max/depthIsGL
+combos x 10 stored values (incl. NaN/±inf stored, NaN/inf/degenerate
+far, zero subranges, out-of-range depths). All gates pass: finite
+everywhere, mirrors cross-consistent (eye-Z vs warpNear/splat-NDC),
+analytically exact on valid standard-orientation combos (tolerance 1e-3,
+50x inside the 5% edge bands; the single 2e-4 deviation seen at
+n=0.01/f=100 is float32 precision, not a bug), monotonic with the
+correct sign. Validation context: min/maxDepth outside [0,1] or
+min>max and nearZ==farZ are rejected in `oxr_session_frame_end.c`
+before reaching the shader, so those combos only owe robustness.
+
+Correction to the prior-art note ("already handles reversed"): it does
+not. A reversed-Z buffer (1.0 at near) under reported-normal params
+inverts end to end (d=0 reads near instead of far, d=1 reads far
+instead of near); under reported-swapped params (`nearZ>farZ`) it
+explodes (d=0.5 -> 200 vs truth 0.2, d=1.0 -> 1e30 vs truth 0.1). The
+`f<=n` branch only avoids a crash — it does not linearize. No
+in-tree producer emits reversed params (defaults near=0.1/far=0
+infinite, standard), so no live behavior changes; shader behavior is
+deliberately untouched without a live reversed source to validate a
+fix against. Instead both warp UBO fill sites (`comp_renderer.c`
+compute path, `comp_render_gfx.c` graphics path) warn once on the
+reversed signal (`0 < far_z < near_z`), turning a future silent
+whole-scene inversion into a one-line diagnosis. The matrix pins the
+current behavior, so a future fix arrives with a failing-then-passing
+test.
+
 ## 2026-09-06 follow-up: fidelity-plan item 1 (agreement-weighted warp taps) — tested, rejected
 
 Candidate: on the disagreement path, when the occlusion test does not

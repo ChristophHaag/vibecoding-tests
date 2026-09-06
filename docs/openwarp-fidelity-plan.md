@@ -56,14 +56,22 @@ crops. Files: `openwarp_splat.comp`, warp dispatch in
 `monado/src/xrt/auxiliary/render/shaders/`,
 `compositor/main/comp_renderer.c`.
 
-### 3. Depth-convention test matrix — days
+### 3. Depth-convention test matrix — DONE 2026-09-06
 
-`app_depth_to_eye_z` (`openwarp.comp:158`, mirrored in the splat pass)
-handles reversed / infinite-far / GL-clip / subrange / NaN by reading,
-with no dedicated coverage. Extend the sim over
-near/far/min/max/depthIsGL combinations. Wrong linearization is an
-edge factory (misplaced silhouettes); this closes the class cheaply.
-Gate: all combinations produce finite, monotonic eye-Z.
+`scripts/owdepth-conventions.py` ports all three linearization copies
+(`openwarp_splat.comp` + `openwarp_mesh.vert`
+`convert_app_depth_to_warp_ndc`, `openwarp.comp` `app_depth_to_eye_z`)
+in float32 and checks 400 near/far/min/max/depthIsGL combos x 10 stored
+values: finite everywhere, mirrors cross-consistent, analytically exact
+on valid standard combos, monotonic with the correct sign. One real
+finding: reversed-Z buffers are NOT handled (prior "handles reversed"
+note was wrong — `f<=n` only avoids a crash). Reported-normal reversed
+inverts end to end; reported-swapped (`nearZ>farZ`) explodes
+(`owdepth-conventions.py` pins both). No shader-behavior change without
+a live reversed source to validate against; instead both warp UBO fill
+sites (`comp_renderer.c`, `comp_render_gfx.c`) now warn once on the
+reversed signal (`0 < far_z < near_z`) so a future submission fails
+loudly instead of as mystery warp artifacts.
 
 ### 4. Coverage-hole debug view — days
 
