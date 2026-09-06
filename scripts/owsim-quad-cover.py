@@ -391,3 +391,47 @@ for t in (0.008, 0.023, 0.05, 0.057, 0.13, 0.15):
         row += f" | s={s:.3f}: {q[0]:4d} {q[1]:4d} {q[2]:3d} {q[3]:4d} {q[4]:6.1f}"
     print(row)
 Z_BG = _Z_BG_SAVE
+
+# Plan item 2 triage (live A/B blocked on the sandbox capture outage):
+# what does splatting + reprojecting from low-res depth cost in quality?
+# Downsample src_z by FACTOR (min preserves foreground, box averages),
+# hold it low-res through splat AND reproject taps (aggressive variant:
+# one downsample stage feeding both passes, the bandwidth win), compare
+# against full-res baseline. Gate for pursuing live: zero regression.
+print()
+print("item2: shape t | fullres bad fringe cut holes mass | per-variant ...")
+FG_SHAPE = "diamond"
+
+
+def downsample_z(z, factor, mode):
+    zh, zw = z.shape
+    small = np.zeros((zh // factor, zw // factor))
+    for j in range(small.shape[0]):
+        for i in range(small.shape[1]):
+            blk = z[j * factor:(j + 1) * factor, i * factor:(i + 1) * factor]
+            small[j, i] = blk.min() if mode == "min" else blk.mean()
+    return small.repeat(factor, axis=0).repeat(factor, axis=1)
+
+
+for shape in ("diamond", "disc", "bar"):
+    FG_SHAPE = shape
+    for t in (0.008, 0.023, 0.057):
+        src_c, src_z = render_scene(0.0)
+        gt_c, _ = render_scene(t)
+        wd, _ = splat(src_z, t, "bbox")
+        base = metrics(reproject_final(src_c, src_z, wd, t), gt_c)
+        row = f"{shape:7s} {t * 1000:5.1f}mm | full: {base[0]:4d} {base[1]:4d} {base[2]:3d} {base[3]:4d} {base[4]:6.1f}"
+        for factor, mode in ((2, "min"), (2, "box"), (4, "min"), (4, "box")):
+            lz = downsample_z(src_z, factor, mode)
+            lw, _ = splat(lz, t, "bbox")
+            q = metrics(reproject_final(src_c, lz, lw, t), gt_c)
+            row += f" | {factor}x-{mode}: {q[0]:4d} {q[1]:4d} {q[2]:3d} {q[3]:4d} {q[4]:6.1f}"
+        # Splat-only variant: splat from 2x-min depth, but reproject taps
+        # read full-res (keeps the edge machinery exact; only splat
+        # atomics/bandwidth drop). If this holds quality, it is the shape
+        # a live implementation must take.
+        lz2 = downsample_z(src_z, 2, "min")
+        lw2, _ = splat(lz2, t, "bbox")
+        qs = metrics(reproject_final(src_c, src_z, lw2, t), gt_c)
+        row += f" | splat-only2x-min: {qs[0]:4d} {qs[1]:4d} {qs[2]:3d} {qs[3]:4d} {qs[4]:6.1f}"
+        print(row)

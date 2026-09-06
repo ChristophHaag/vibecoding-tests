@@ -46,15 +46,26 @@ so agreement votes foreground on truth-background pixels, and the sigma
 axis has no useful middle. No shader change. Do not retry without
 coverage data (item 5).
 
-### 2. Low-res depth experiment — days
+### 2. Low-res depth experiment — TRIAGED 2026-09-06, live A/B pending capture repair
 
-Downsample app depth 2x/4x before the splat; A/B with
-`analyze-warp.py`. Meta's no-loss claim (PTW runs on 368x400 depth)
-predicts pure bandwidth win on splat + warp. If quality holds, the
-freed budget funds items 3–4. Gate: zero metric regression on edge
-crops. Files: `openwarp_splat.comp`, warp dispatch in
-`monado/src/xrt/auxiliary/render/shaders/`,
-`compositor/main/comp_renderer.c`.
+Sim triage in `owsim-quad-cover.py` (`item2` block: splat + reproject
+from downsampled depth, all shapes x 8/23/57 mm): box-filter
+downsampling is catastrophic everywhere (fringe/cut/holes explode —
+averaging across steps fabricates neither-surfaces; killed as a
+variant). Min-downsample full-pipeline keeps hard counters but shifts
+mass both ways and regresses thin geometry (bar 8 mm: bad 0→60, mass
+13→24) — Meta's no-loss claim does not transfer directly, because our
+agreement/occlusion edge machinery reads the same buffer. The
+splat-only split (2x-min splat, full-res reproject taps) is the standout:
+fringe+mass down at larger shifts on every shape (bar 57 mm: fringe
+52→0, mass 76→28; diamond 57 mm: mass 77→59; disc 57 mm: mass 69→58),
+cut never moves, small-shift bad-count churn at ~flat mass. Mechanism
+for the large-shift fringe wins is not fully understood — no shader
+change until a live same-pose A/B (`analyze-warp.py`) confirms. If
+pursued live, the shape is fixed: keep full-res depth for the
+reproject taps, downsample only the splat input (splat atomics are the
+bandwidth to win). Constraint from the MV track stands: build the
+downsampler as a reusable stage, not warp-inlined.
 
 ### 3. Depth-convention test matrix — DONE 2026-09-06
 

@@ -1146,6 +1146,35 @@ whole-scene inversion into a one-line diagnosis. The matrix pins the
 current behavior, so a future fix arrives with a failing-then-passing
 test.
 
+## 2026-09-06 follow-up: fidelity-plan item 2 (low-res depth) — sim triage, live pending
+
+`scripts/owsim-quad-cover.py` `item2` block. Box downsampling (either
+factor, full pipeline): fringe/cut/holes all explode — killed.
+Min-downsample full pipeline: hard counters hold but mass regresses on
+thin geometry (bar 8/23 mm mass 13→24/24→33). Splat-only 2x-min
+(downsampled splat input, full-res reproject taps):
+
+```
+diamond  8mm: full bad16 mass24.9 -> splat-only bad36 mass26.2
+diamond 23mm: full bad50 mass41.7 -> splat-only bad50 mass36.8
+diamond 57mm: full fringe42 mass77.3 -> splat-only fringe24 mass58.5
+disc    57mm: full fringe40 mass69.2 -> splat-only fringe28 mass57.5
+bar      8mm: full bad0  mass13.0 -> splat-only bad30 mass15.4
+bar     23mm: full bad30 mass24.0 -> splat-only bad30 mass18.1
+bar     57mm: full fringe52 mass76.0 -> splat-only fringe0 mass28.1
+cut never moves anywhere.
+```
+
+Large-shift fringe+mass wins on every shape with only small-shift
+bad-count churn at ~flat mass — but the mechanism is not understood
+(coarser min-splat should dilate fg, yet fringe falls), so no shader
+change: this needs the live same-pose A/B before anything ships. Live
+A/B blocked on the sandbox capture outage. Takeaway for the eventual
+implementation: never coarsen the reproject taps (the agreement and
+occlusion machinery needs full-res); the splat input is the only
+downsample candidate, built as a reusable stage per the MV-track
+constraint.
+
 ## 2026-09-06 follow-up: fidelity-plan item 4 (coverage-hole debug view) — done
 
 New `RENDER_OPENWARP_DEBUG_SHOW_HOLES` bit + shader branch: true
