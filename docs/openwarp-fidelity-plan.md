@@ -74,15 +74,17 @@ downsampler as a reusable stage, not warp-inlined.
 `convert_app_depth_to_warp_ndc`, `openwarp.comp` `app_depth_to_eye_z`)
 in float32 and checks 400 near/far/min/max/depthIsGL combos x 10 stored
 values: finite everywhere, mirrors cross-consistent, analytically exact
-on valid standard combos, monotonic with the correct sign. One real
-finding: reversed-Z buffers are NOT handled (prior "handles reversed"
-note was wrong — `f<=n` only avoids a crash). Reported-normal reversed
-inverts end to end; reported-swapped (`nearZ>farZ`) explodes
-(`owdepth-conventions.py` pins both). No shader-behavior change without
-a live reversed source to validate against; instead both warp UBO fill
-sites (`comp_renderer.c`, `comp_render_gfx.c`) now warn once on the
-reversed signal (`0 < far_z < near_z`) so a future submission fails
-loudly instead of as mystery warp artifacts.
+on valid standard AND finite-reversed combos, monotonic with the
+orientation-correct sign. Reversed-Z fix 2026-09-06: the old
+`!(f > n)` test routed finite reversed (`0 < far < near`) into the
+infinite-far branch, exploding near geometry to infinity — the finite
+perspective inverse is correct for both orderings, so the branch is now
+infinite iff far is <= 0 / infinite / NaN (all three shader copies).
+Reported-swapped (`nearZ>farZ`, e.g. live 4000/0.05) linearizes exactly;
+a reversed buffer reported in normal order contradicts its own depths
+and stays unfixable by definition. The warn-once guards added earlier
+at both warp UBO fill sites are removed — reversed is a supported case
+now, not a hazard.
 
 ### 4. Coverage-hole debug view — DONE 2026-09-06
 

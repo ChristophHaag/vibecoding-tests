@@ -1,5 +1,5 @@
 """Depth-convention test matrix for the openwarp depth linearization
-(fidelity-plan item 3).
+(fidelity-plan item 3, reversed-depth fix 2026-09-06).
 
 Three shader copies share one front-end and must stay in sync:
   monado/.../shaders/openwarp_splat.comp  convert_app_depth_to_warp_ndc
@@ -13,14 +13,19 @@ shader semantics, then checked over a near/far/min/max/depthIsGL matrix:
   gate 1 (plan gate): every combination yields FINITE, non-NaN output.
   gate 2: the two warp-NDC copies agree bit-for-bit; warp eye-Z agrees
           with warpNear/splat-NDC (cross-consistency of the mirrors).
-  gate 3: on VALID standard-orientation combos the value matches the
-          analytic projection inverse (correctness, not just finiteness).
+  gate 3: on VALID combos the value matches the analytic projection
+          inverse — standard orientation (0=near,1=far) AND finite
+          reversed (farZ<nearZ: 0=far,1=near, either reporting order
+          linearizes via the same finite formula).
   gate 4: monotonicity over stored depth has the orientation-correct sign
-          (non-decreasing for standard buffers).
-  recorded: reversed-Z buffers (nearZ>farZ reporting, either order) are
-          NOT linearized correctly by the current front-end (documented
-          limitation, see bottom) — the matrix pins the behavior so any
-          future fix has a failing-then-passing test.
+          (non-decreasing for standard buffers, non-increasing for
+          finite reversed ones).
+
+Reporting note: OpenXR validation only rejects nearZ==farZ, so an app
+rendering reversed-Z signals it by reporting farZ<nearZ (swapped order).
+A reversed buffer reported in normal order contradicts its own depths
+and is unfixable by definition — the runtime must trust the reporting;
+that combination is recorded, not gated.
 
 Validation context (oxr_session_frame_end.c): min/maxDepth must be in
 [0,1] with min<=max and nearZ!=farZ, else the layer is rejected before
@@ -57,11 +62,12 @@ def port_convert_ndc(d_stored, n, f, mn, mx, is_gl):
     else:
         dn = d_stored - mn
     dn = F32(min(max(float(dn), 0.0), 1.0))
-    if (f <= F32(0.0)) or not (f > n) or bool(np.isinf(f)) or bool(np.isnan(f)):
+    if (f <= F32(0.0)) or bool(np.isinf(f)) or bool(np.isnan(f)):
         if dn >= F32(1.0):
             return F32(0.0)
         z_eye = n / (F32(1.0) - dn)
     elif is_gl == 1:
+        # Finite far, either orientation (standard and reversed alike).
         ndc = dn * F32(2.0) - F32(1.0)
         z_eye = (F32(2.0) * n * f) / ((f + n) - (f - n) * ndc)
     else:
@@ -84,11 +90,12 @@ def port_eye_z(d_stored, n, f, mn, mx, is_gl):
     else:
         dn = d_stored - mn
     dn = F32(min(max(float(dn), 0.0), 1.0))
-    if (f <= F32(0.0)) or not (f > n) or bool(np.isinf(f)) or bool(np.isnan(f)):
+    if (f <= F32(0.0)) or bool(np.isinf(f)) or bool(np.isnan(f)):
         if dn >= F32(1.0):
             return F32(FAR_SENTINEL_Z)
         return n / (F32(1.0) - dn)
     elif is_gl == 1:
+        # Finite far, either orientation (standard and reversed alike).
         ndc = dn * F32(2.0) - F32(1.0)
         return (F32(2.0) * n * f) / ((f + n) - (f - n) * ndc)
     else:
@@ -97,12 +104,18 @@ def port_eye_z(d_stored, n, f, mn, mx, is_gl):
 
 def truth_standard(dn, n, f, is_gl):
     """Analytic eye-Z for a standard-orientation buffer (0=near,1=far)."""
-    if f <= 0 or not (f > n) or math.isinf(f) or math.isnan(f):
+    if f <= 0 or math.isinf(f) or math.isnan(f):
         return n / (1.0 - dn) if dn < 1.0 else math.inf
     if is_gl:
         ndc = dn * 2.0 - 1.0
         return (2.0 * n * f) / ((f + n) - (f - n) * ndc)
     return (n * f) / (f - (f - n) * dn)
+
+
+def truth_reversed(dn, lo, hi, is_gl):
+    """Analytic eye-Z for a reversed buffer with actual planes lo..hi
+    (stored 1=near, 0=far): the standard mapping at the mirrored depth."""
+    return truth_standard(1.0 - dn, lo, hi, is_gl)
 
 
 NEARS = (0.01, 0.05, 0.1, 0.0, -1.0)
@@ -145,15 +158,23 @@ def run():
                             check(rel < 1e-4,
                                   f"mirror mismatch n={n} f={f} sub=({mn},{mx}) gl={is_gl} d={d}: "
                                   f"eye={v_eye} vs warpNear/ndc={float(WARP_NEAR / v_ndc)}")
-                    # gate 4: monotonic non-decreasing over the in-range grid
-                    # for valid standard combos (NaN/inf/out-of-range exempt).
+                    # gate 4: monotonicity over the in-range grid, with the
+                    # orientation-correct sign (standard non-decreasing,
+                    # finite reversed non-increasing; NaN/inf/out-of-range
+                    # exempt).
                     valid = (n > 0 and (math.isinf(f) or (f > n and f > 0)) and mn <= mx
                              and 0.0 <= mn and mx <= 1.0)
+                    valid_rev = (n > 0 and 0.0 < f < n and not math.isinf(f) and not math.isnan(f)
+                                 and mn <= mx and 0.0 <= mn and mx <= 1.0)
                     if valid and (mn, mx) == (0.0, 1.0):
                         seq = [float(port_eye_z(d, n, f, mn, mx, is_gl)) for d in (0.0, 0.25, 0.5, 0.75)]
                         check(all(b >= a for a, b in zip(seq, seq[1:])),
                               f"non-monotonic n={n} f={f} gl={is_gl}: {seq}")
-                    # gate 3: analytic correctness on valid standard combos.
+                    if valid_rev and (mn, mx) == (0.0, 1.0):
+                        seq = [float(port_eye_z(d, n, f, mn, mx, is_gl)) for d in (0.0, 0.25, 0.5, 0.75)]
+                        check(all(b <= a for a, b in zip(seq, seq[1:])),
+                              f"reversed non-monotonic n={n} f={f} gl={is_gl}: {seq}")
+                    # gate 3: analytic correctness on valid combos.
                     if valid:
                         for d in (0.0, 0.25, 0.5, 0.75, 1.0):
                             dn = min(max((d - mn) / (mx - mn if mx != mn else 1.0), 0.0), 1.0)
@@ -170,25 +191,34 @@ def run():
                                 # still 50x tighter than the 5% edge bands.
                                 check(abs(got - t) / max(t, 1e-9) < 1e-3,
                                       f"value mismatch n={n} f={f} gl={is_gl} d={d}: got {got}, truth {t}")
+                    if valid_rev:
+                        for d in (0.0, 0.25, 0.5, 0.75, 1.0):
+                            dn = min(max((d - mn) / (mx - mn if mx != mn else 1.0), 0.0), 1.0)
+                            if (mn, mx) != (0.0, 1.0):
+                                continue  # subrange remap has no single truth dn; finiteness only
+                            t = truth_reversed(dn, f, n, is_gl)
+                            got = float(port_eye_z(d, n, f, mn, mx, is_gl))
+                            check(abs(got - t) / max(t, 1e-9) < 1e-3,
+                                  f"reversed mismatch n={n} f={f} gl={is_gl} d={d}: got {got}, truth {t}")
     print(f"matrix: {n_checked} param combos x {len(D_GRID)} stored values, "
           f"{len(failures)} failures")
     for msg in failures[:20]:
         print("FAIL:", msg)
 
-    # Recorded limitation: reversed-Z buffers. An app rendering reversed-Z
-    # stores 1.0 at near / 0.0 at far. Under either reporting order the
-    # front-end assumes 0=near/1=far, so geometry inverts end to end.
+    # Finite reversed buffers (farZ<nearZ reporting) now linearize via
+    # the same finite formula — demonstrated and gated in the matrix
+    # above (gate 3 valid_rev). What stays unfixable: a reversed buffer
+    # reported in NORMAL order contradicts its own depths (the runtime
+    # must trust the reporting), recorded here, asserts nothing.
     print()
-    print("reversed-buffer behavior (recorded, asserts nothing):")
+    print("reversed-buffer behavior (swapped reporting is gated, asserts nothing extra):")
     for label, n, f in (("reported-normal n=0.1 f=100", 0.1, 100.0),
                         ("reported-swapped n=100 f=0.1 (nearZ>farZ)", 100.0, 0.1)):
         # truth: reversed-finite buffer, actual planes 0.1..100.
-        def rev_truth(dn):
-            return 0.1 * 100.0 / (0.1 + dn * (100.0 - 0.1))
         row = []
         for d in (0.0, 0.5, 1.0):
             got = float(port_eye_z(d, n, f, 0.0, 1.0, 0))
-            row.append(f"d={d}: shader {got:.4g} vs reversed-truth {rev_truth(d):.4g}")
+            row.append(f"d={d}: shader {got:.4g} vs reversed-truth {truth_reversed(d, 0.1, 100.0, 0):.4g}")
         print(f"  {label}: " + "; ".join(row))
         reversed_notes.append((label, row))
 
@@ -198,4 +228,4 @@ if __name__ == "__main__":
     if failures:
         print(f"\n{len(failures)} FAILURES")
         sys.exit(1)
-    print("\nall gates pass (reversed-Z limitation recorded, not gated)")
+    print("\nall gates pass (finite reversed-Z gated correct)")

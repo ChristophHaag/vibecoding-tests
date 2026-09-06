@@ -1130,21 +1130,24 @@ correct sign. Validation context: min/maxDepth outside [0,1] or
 min>max and nearZ==farZ are rejected in `oxr_session_frame_end.c`
 before reaching the shader, so those combos only owe robustness.
 
-Correction to the prior-art note ("already handles reversed"): it does
-not. A reversed-Z buffer (1.0 at near) under reported-normal params
-inverts end to end (d=0 reads near instead of far, d=1 reads far
-instead of near); under reported-swapped params (`nearZ>farZ`) it
-explodes (d=0.5 -> 200 vs truth 0.2, d=1.0 -> 1e30 vs truth 0.1). The
-`f<=n` branch only avoids a crash — it does not linearize. No
-in-tree producer emits reversed params (defaults near=0.1/far=0
-infinite, standard), so no live behavior changes; shader behavior is
-deliberately untouched without a live reversed source to validate a
-fix against. Instead both warp UBO fill sites (`comp_renderer.c`
-compute path, `comp_render_gfx.c` graphics path) warn once on the
-reversed signal (`0 < far_z < near_z`), turning a future silent
-whole-scene inversion into a one-line diagnosis. The matrix pins the
-current behavior, so a future fix arrives with a failing-then-passing
-test.
+## 2026-09-06 follow-up: reversed-Z fix (live 4000/0.05 report) — done
+
+A live layer reporting nearZ=4000/farZ=0.05 tripped the warn-once guard
+above — a real reversed-depth submission, and the reason to fix rather
+than warn. Root cause: the old `!(f > n)` test routed finite reversed
+(`0 < far < near`) into the infinite-far branch `n/(1-dn)`, exploding
+near geometry to infinity (d=1 -> 1e30 instead of 0.05). The finite
+perspective inverse is correct for both orderings (swapping near/far
+just flips which end dn=0 lands on), so all three shader copies now
+take the infinite branch iff far is <= 0 / infinite / NaN — standard
+paths bit-identical, finite reversed exact. Verified: matrix green over
+all 400 combos with reversed analytic + monotonic gates added (both GL
+conventions), the reported-swapped row matches reversed truth exactly,
+user's 4000/0.05 params check d=0->4000 / d=1->0.05 decreasing,
+glslangValidator clean on all three shaders, `monado-service` links.
+Warn-once guards removed from both UBO fill sites; plan item 3 updated.
+Still unfixable by definition: a reversed buffer reported in NORMAL
+order contradicts its own depths (runtime must trust the reporting).
 
 ## 2026-09-06 follow-up: fidelity-plan item 7, FLIP half (analyze-warp `--flip`) — done
 
