@@ -1149,6 +1149,27 @@ Warn-once guards removed from both UBO fill sites; plan item 3 updated.
 Still unfixable by definition: a reversed buffer reported in NORMAL
 order contradicts its own depths (runtime must trust the reporting).
 
+## 2026-09-06 follow-up: OpenWarp disable checkbox + freshness viz — done
+
+Debug panel gains **Disable OpenWarp (plane timewarp)**
+(`MONADO_OPENWARP_DISABLE`): one checkbox bypasses the depth path on
+both renderers — compute skips the splat+reproject dispatch (falls into
+the existing distortion fast path), gfx routes the depth-warp branch to
+`crg_distortion_fast_path` on the color views (new `disable_openwarp`
+field on the dispatch data). Status reports `OFF: disabled, plane
+timewarp`. Verified live: playground FOCUSED with the bypass forced on.
+
+Same change adds a synth-vs-touchup history: each commit compares the
+base layer's swapchain identity (pointers + image indices) against the
+last commit — unchanged means the app missed its slot and the frame was
+fully synthesized. Panel shows a 360-frame `0=fresh/1=synth` plot, a
+trailing-3s `app Xfps synth N/M` line (fresh rate doubles as a crude app
+fps counter), and fresh/synth totals. Verified live at default playground
+pacing: `app 15.0fps synth 136/181 (75%)`. Known heuristic limits:
+single-image swapchains re-rendered in place read as stale; the window
+math uses 64-bit ns (a `3 * U_TIME_1S_IN_NS` 32-bit overflow blanked the
+window on the first live run — caught by the same run, fixed).
+
 ## 2026-09-06 follow-up: fidelity-plan item 7, FLIP half (analyze-warp `--flip`) — done
 
 `scripts/analyze-warp.py --flip` (needs `pip install flip-evaluator`;
