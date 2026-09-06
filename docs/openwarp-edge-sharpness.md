@@ -1114,3 +1114,39 @@ equivalents noted where they exist.
   pass (Unity 2022.3+); depth-only fallback is complete for statics.
 - **`XrSpaceWarp` sample** — Oculus native sample app; known-good
   MV/depth generator for validating a future implementation.
+
+## 2026-09-06 follow-up: fidelity-plan item 1 (agreement-weighted warp taps) — tested, rejected
+
+Candidate: on the disagreement path, when the occlusion test does not
+fire, replace the plain bilinear with a blend of the 2x2 taps weighted
+by spatial bilinear weight x gaussian agreement
+`exp(-(log(zt/z_exp)/sigma)^2)` per tap (ExtraSS bilateral warp in
+miniature, fidelity-plan item 1). Sigmas 0.025/0.05/0.10, all three
+shapes, six shifts, plus a close-range variant (Z_BG 5.0 -> 1.3, the
+population the far-side-nearest live revert showed the 5x rig misses).
+Matrix in `scripts/owsim-quad-cover.py` (`agree_sigma` path in
+`reproject_final`, `item1` / `item1-close` blocks).
+
+Result: converts cut to fringe and raises mass almost everywhere it
+changes anything; all three sigmas saturate identically.
+
+```
+diamond  8mm: base bad16 fringe7 cut7 mass24.9 -> wtd bad10 fringe9 cut1 mass22.0
+diamond 23mm: base bad50 fringe12 cut11 mass41.7 -> wtd bad39 fringe39 cut0 mass51.8
+disc    23mm: base bad42 fringe10 cut2 mass33.7 -> wtd bad40 fringe40 cut0 mass51.3
+bar     23mm: base bad30 fringe0 cut0 mass24.0 -> wtd bad30 fringe30 cut0 mass42.9
+close-range diamond 23mm (Z_BG=1.3): base bad30 fringe0 mass8.1 -> wtd bad30 fringe30 mass27.0
+50/130/150mm: bit-identical (agreement/occlusion/stretch paths untouched)
+```
+
+Mechanism (same family as the always-match rejection): `z_exp` inherits
+the splat's half-texel foreground dilation, so agreement weights vote
+foreground on pixels whose truth is background. With 5x fg/bg separation
+any surface-distinguishing sigma saturates to a hard switch (all three
+sigmas bit-identical); with close ratios it hardens sub-threshold soft
+mixes into over-threshold fringe (close-range 23mm: mass 8.1 -> 27.0,
+fringe 0 -> 30). The sigma axis has no useful middle: sigmas small
+enough to distinguish surfaces saturate, sigmas large enough to stay
+soft stop distinguishing and degrade to bilinear. Position-weighted
+bilinear remains the best static estimate without coverage data. No
+shader change; the plan gate ("any halo regression kills it") fires.

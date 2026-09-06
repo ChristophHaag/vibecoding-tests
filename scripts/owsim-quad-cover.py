@@ -13,6 +13,14 @@ nearest texel instead of bilinear; zero extra taps). Splat modes 'exact'
 (wider clamp + inside test) were also tried here: all trade fringe<->cut,
 none dominates — see the work log. Kept for the record.
 
+Fidelity-plan item 1 (agreement-weighted warp taps, ExtraSS bilateral
+warp in miniature): AGREE_SIGMAS lists the candidate range sigmas. On the
+disagreement path, when the filtered-depth occlusion test does NOT fire,
+the legacy plain bilinear is replaced by a blend of the 4 taps weighted
+by spatial bilinear weight x gaussian agreement of each tap's depth with
+z_exp. Occlusion/stretch/agreement paths are untouched. Gate: bad/cut
+down vs baseline with fringe bit-identical (any halo regression kills it).
+
 Metrics mirror scripts/owsim-edge-sharp.py: bad (abs err > 0.1), fringe
 (bg-truth painted fg), cut (fg-truth painted bg), holes (honest black), mass
 (total abs error).
@@ -204,7 +212,8 @@ def taps2x2(img, u, v):
     return out
 
 
-def reproject_final(src_c, src_z, wdepth, t, stretch=True, farside_nearest=False):
+def reproject_final(src_c, src_z, wdepth, t, stretch=True, farside_nearest=False,
+                      agree_sigma=None):
     """Mirror of sample_source_sharp (agreement -> sharp, else legacy) plus
     the 13x13 closest-valid stretch fill (ties toward farthest, reproject
     through the neighbour's center with nearest-texel sampling).
@@ -214,7 +223,14 @@ def reproject_final(src_c, src_z, wdepth, t, stretch=True, farside_nearest=False
     bilinear. No extra taps: z_ref/zt already fetched. Rationale: the
     bilinear kernel at a step always mixes surfaces; the nearest tap is the
     surface the UV actually addresses. Should blacken dilation/excess
-    pixels (truth bg) while leaving agreement pixels bit-identical."""
+    pixels (truth bg) while leaving agreement pixels bit-identical.
+    agree_sigma (plan item 1 candidate): on the disagreement path, when the
+    occlusion test does NOT fire, replace the plain bilinear with a blend
+    of the 4 taps weighted by spatial bilinear weight times gaussian
+    agreement exp(-(log(zt/z_exp)/sigma)^2) of each tap's depth with z_exp
+    (ExtraSS bilateral warp in miniature). Gaussian weights never hit zero,
+    so windows where nothing agrees degrade gracefully back to ~bilinear.
+    Occlusion, stretch, and agreement paths are untouched."""
     out = np.zeros((H, W))
 
     def shade(i, j, zw, ci, cj, force_nearest):
@@ -264,6 +280,24 @@ def reproject_final(src_c, src_z, wdepth, t, stretch=True, farside_nearest=False
             xx = min(max(int(math.floor(u + 0.5)), 0), W - 1)
             yy = min(max(int(math.floor(v + 0.5)), 0), H - 1)
             return src_c[yy, xx]
+        if agree_sigma is not None:
+            # Agreement-weighted taps: spatial weight x gaussian depth
+            # agreement with z_exp, renormalized.
+            fx = u - x0
+            fy = v - y0
+            wsp = [(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy]
+            num, den = 0.0, 0.0
+            for k in range(4):
+                tx = min(max(x0 + (k % 2), 0), W - 1)
+                ty = min(max(y0 + (k // 2), 0), H - 1)
+                r = math.log(max(zt[k], 1e-9) / max(z_exp, 1e-9)) / agree_sigma
+                w = wsp[k] * math.exp(-r * r)
+                num += w * src_c[ty, tx]
+                den += w
+            if den > 1e-12:
+                return num / den
+            # else: fall through to legacy bilinear (cannot happen with a
+            # gaussian, kept for structural parity with the shader port).
         return bilinear(src_c, u, v)
 
     for j in range(H):
@@ -319,3 +353,41 @@ for t in (0.008, 0.023, 0.05, 0.057, 0.13, 0.15):
         f"{t * 1000:5.1f}mm | bbox: {bo:4d} {fo:4d} {co:3d} {ho:4d} {mo:6.1f} "
         f"| far:  {ba:4d} {fa:4d} {ca:3d} {ha:4d} {ma:6.1f}"
     )
+
+# Plan item 1 matrix: agreement-weighted taps across shapes x shifts.
+# Gate: bad/cut down vs baseline, fringe bit-identical (halo kills it).
+AGREE_SIGMAS = (0.025, 0.05, 0.10)
+print()
+print("item1: shape t | base bad fringe cut holes mass | per-sigma bad fringe cut holes mass")
+for shape in ("diamond", "disc", "bar"):
+    FG_SHAPE = shape
+    for t in (0.008, 0.023, 0.05, 0.057, 0.13, 0.15):
+        src_c, src_z = render_scene(0.0)
+        gt_c, _ = render_scene(t)
+        wd, _ = splat(src_z, t, "bbox")
+        base = metrics(reproject_final(src_c, src_z, wd, t), gt_c)
+        row = f"{shape:7s} {t * 1000:5.1f}mm | base: {base[0]:4d} {base[1]:4d} {base[2]:3d} {base[3]:4d} {base[4]:6.1f}"
+        for s in AGREE_SIGMAS:
+            q = metrics(reproject_final(src_c, src_z, wd, t, agree_sigma=s), gt_c)
+            row += f" | s={s:.3f}: {q[0]:4d} {q[1]:4d} {q[2]:3d} {q[3]:4d} {q[4]:6.1f}"
+        print(row)
+
+# Close-range variant: the far-side-nearest live revert proved the 5x rig
+# misses the multi-layer close-geometry population (magnified truth-fg
+# edges, depth ratios ~1.1-1.5 where soft weights could behave
+# differently than the saturated 5x case). Same diamond, bg pulled in.
+print()
+print("item1-close: Z_BG=1.3 t | base bad fringe cut holes mass | per-sigma ...")
+_Z_BG_SAVE = Z_BG
+Z_BG = 1.3
+for t in (0.008, 0.023, 0.05, 0.057, 0.13, 0.15):
+    src_c, src_z = render_scene(0.0)
+    gt_c, _ = render_scene(t)
+    wd, _ = splat(src_z, t, "bbox")
+    base = metrics(reproject_final(src_c, src_z, wd, t), gt_c)
+    row = f"{t * 1000:5.1f}mm | base: {base[0]:4d} {base[1]:4d} {base[2]:3d} {base[3]:4d} {base[4]:6.1f}"
+    for s in AGREE_SIGMAS:
+        q = metrics(reproject_final(src_c, src_z, wd, t, agree_sigma=s), gt_c)
+        row += f" | s={s:.3f}: {q[0]:4d} {q[1]:4d} {q[2]:3d} {q[3]:4d} {q[4]:6.1f}"
+    print(row)
+Z_BG = _Z_BG_SAVE

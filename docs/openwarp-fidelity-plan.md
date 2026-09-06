@@ -32,15 +32,19 @@ edge defect classes this plan attacks.
 
 ## Work items (in order)
 
-### 1. Agreement-weighted warp taps — days
+### 1. Agreement-weighted warp taps — TESTED 2026-09-06, REJECTED
 
-Replace the binary accept in the 3x3 warp neighborhood with
-depth-agreement weights (ExtraSS bilateral warp in miniature). Best
-near-term chance of reducing nicks without reintroducing halo.
-Sim-first in `owsim-quad-cover.py`, then live A/B on identical
-teleports. Gate: bad/fringe/cut counts vs the current zero-fringe
-baseline; any halo regression kills it (cf. far-side-nearest revert).
-Files: `openwarp.comp` (`sample_source_sharp`), sim script.
+Tried: gaussian agreement weights (`exp(-(log(zt/z_exp)/sigma)^2)`,
+sigmas 0.025/0.05/0.10) on the non-occluded disagreement path, all
+shapes x six shifts plus a close-range (Z_BG=1.3) variant — matrix in
+`owsim-quad-cover.py`, numbers in `openwarp-edge-sharpness.md`. Result:
+cut converts to fringe and mass rises wherever it changes anything
+(e.g. bar 23 mm: fringe 0→30, mass 24→42.9; close-range diamond 23 mm:
+mass 8.1→27.0, fringe 0→30); all sigmas saturate identically. Same
+failure family as always-match: `z_exp` inherits the splat's dilation,
+so agreement votes foreground on truth-background pixels, and the sigma
+axis has no useful middle. No shader change. Do not retry without
+coverage data (item 5).
 
 ### 2. Low-res depth experiment — days
 
