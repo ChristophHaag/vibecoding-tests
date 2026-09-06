@@ -3,6 +3,10 @@
 /build-*/
 # Python cache
 __pycache__/
+# Temp repro screenshots (one-off captures, never committed)
+/repro_*.png
+/quad-openwarp*.png
+/openwarp-fray-repro.png
 /build-*/
 /debug_layer/build/
 /debug_layer/build-*/
