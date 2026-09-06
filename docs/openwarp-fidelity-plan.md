@@ -120,12 +120,16 @@ window dominating (they don't today) — keep as the standing answer,
 not active work. Pull-push pyramid stays parked behind it for the same
 reason.
 
-### 7. Settle accounting + FLIP migration — ongoing tooling
+### 7. Settle accounting + FLIP migration — FLIP half DONE 2026-09-06
 
-1spp-style frames-to-detail metric for the stale-window tooling
-("converges in N frames" instead of ad-hoc sleeps); migrate
-`analyze-warp.py` abs-err counts to FLIP maps + mean. Makes every
-item above judgeable. Files: `scripts/`.
+`analyze-warp.py` gained `--flip`: each FFT-aligned eye pair is scored
+with the FLIP evaluator (reference fresh, test warped, LDR, default 67
+PPD recorded in the JSON) as `flip_mean`/`flip_p99`/`flip_pct01` plus a
+magma `<out>_<eye>_flip.png` map — additive, all existing abs-err
+outputs bit-identical without the flag. Verified on the
+`repro_double_*` same-pose pair: deterministic, 0.0 on identical inputs
+(no dark-scene floor), nonzero on artifact crops. Remaining: settle
+accounting (frames-to-detail metric for the burst tooling).
 
 ## Explicit non-goals (tested or scoped out)
 

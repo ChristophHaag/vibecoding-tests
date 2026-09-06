@@ -1146,6 +1146,17 @@ whole-scene inversion into a one-line diagnosis. The matrix pins the
 current behavior, so a future fix arrives with a failing-then-passing
 test.
 
+## 2026-09-06 follow-up: fidelity-plan item 7, FLIP half (analyze-warp `--flip`) — done
+
+`scripts/analyze-warp.py --flip` (needs `pip install flip-evaluator`;
+default path dependency-free): FLIP mean/p99/>0.1-fraction per aligned
+eye + magma overlay, additive to the existing halo/missing/resid
+outputs. Checks on the `repro_double_*` pair: deterministic across
+runs, exactly 0.0 on the identity pair (no systematic floor on dark
+playground frames), 0.149/0.067 on artifact crops vs 0.0 on identical
+crops, existing metrics untouched. Settle accounting (frames-to-detail
+for burst tooling) still open.
+
 ## 2026-09-06 follow-up: fidelity-plan item 2 (low-res depth) — sim triage, live pending
 
 `scripts/owsim-quad-cover.py` `item2` block. Box downsampling (either

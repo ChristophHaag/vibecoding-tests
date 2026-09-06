@@ -12,12 +12,20 @@ cross-correlation, then three artifact classes are counted:
           and background-cut errors on foreground)
   resid   overall mean abs diff + pct of pixels > threshold after alignment
 
+With --flip, each aligned eye pair is also scored with the FLIP
+difference evaluator (Andersson et al. 2020: color + feature pipeline
+that up-weights silhouette differences, pooled by mean) — reported as
+flip_mean / flip_p99 alongside the abs-err counts, plus a magma
+<out>_<eye>_flip.png map when --out is given. Needs the flip-evaluator
+package (pip install flip-evaluator); without --flip the script has no
+extra dependencies. Reference: fresh (settled), test: warped (stale).
+
 Bright/dark is a max-channel threshold (--hi, default 40: suits the
 black-background playground; pass a higher value for bright scenes).
 
 Usage:
   python3 scripts/analyze-warp.py warped.png fresh.png [--out PREFIX]
-      [--maxshift 60] [--hi 40] [--band 4] [--crop x,y,w,h]
+      [--maxshift 60] [--hi 40] [--band 4] [--crop x,y,w,h] [--flip]
   Prints one JSON object to stdout; writes <PREFIX>_<eye>.png overlays
   (red=halo, green=missing) and <PREFIX>_diff.png when --out is given.
 """
@@ -115,7 +123,21 @@ def main():
         help="x,y,w,h crop applied to both images first "
         "(e.g. a static controller region, avoiding animated objects)",
     )
+    ap.add_argument(
+        "--flip",
+        action="store_true",
+        help="also score each aligned eye pair with the FLIP evaluator "
+        "(needs the flip-evaluator package)",
+    )
     args = ap.parse_args()
+
+    flip_mod = None
+    if args.flip:
+        try:
+            import flip_evaluator as flip_mod
+        except ImportError:
+            sys.exit("analyze-warp.py --flip needs the flip-evaluator package: "
+                     "pip install flip-evaluator")
 
     w = load_gray(args.warped)
     f = load_gray(args.fresh)
@@ -131,6 +153,23 @@ def main():
             we, fe, args.hi, args.band, args.maxshift
         )
         out[tag] = m
+        if args.flip:
+            # FLIP on the FFT-aligned pair: reference = fresh (settled),
+            # test = warped (stale). LDR sRGB inputs in [0,1]; default
+            # viewing conditions (67 PPD), recorded for comparability.
+            ref = (fe.astype(np.float32) / 255.0).astype(np.float32)
+            tst = (wa.astype(np.float32) / 255.0).astype(np.float32)
+            raw_map, mean_err, params = flip_mod.evaluate(ref, tst, "LDR", applyMagma=False)
+            raw_map = np.asarray(raw_map, dtype=np.float64)
+            m["flip_mean"] = round(float(mean_err), 6)
+            m["flip_p99"] = round(float(np.percentile(raw_map, 99)), 6)
+            m["flip_pct01"] = round(float((raw_map > 0.1).mean() * 100), 4)
+            m["flip_ppd"] = params.get("ppd", 67)
+            if args.out:
+                magma_map, _, _ = flip_mod.evaluate(ref, tst, "LDR", applyMagma=True)
+                Image.fromarray(np.clip(np.asarray(magma_map) * 255.0, 0, 255).astype(np.uint8)).save(
+                    f"{args.out}_{tag}_flip.png"
+                )
         if args.out:
             ov = np.zeros_like(we)
             ov[halo_m] = (255, 0, 0)
