@@ -1,6 +1,9 @@
 # Local build output
 /build/
 /build-*/
+# Python cache
+__pycache__/
+/build-*/
 /debug_layer/build/
 /debug_layer/build-*/
 /remote-driver-client/build/
