@@ -81,6 +81,9 @@ Re-capture the same stale pose with `MONADO_OPENWARP_*` env on
 
 - `SHOW_OCCLUSION=1` tints occlusion rejects (magenta),
 - `SHOW_STRETCH=1` tints stretch fills (green),
+- `SHOW_HOLES=1` paints true coverage holes solid red (no valid depth
+  even after the stretch search) — splits "no data" from "filled" in
+  one glance; combine with `DISABLE_STRETCH=1` for raw splat coverage,
 - `DEPTH_AS_COLOR=1` shows warp depth (magenta holes = no splat arrived),
 - `DISABLE_OCCLUSION=1` / `DISABLE_STRETCH=1` bisect the fix,
 - `DEPTH_AS_COLOR` doubles as a dispatch probe: colormap output proves

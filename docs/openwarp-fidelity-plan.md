@@ -73,14 +73,21 @@ sites (`comp_renderer.c`, `comp_render_gfx.c`) now warn once on the
 reversed signal (`0 < far_z < near_z`) so a future submission fails
 loudly instead of as mystery warp artifacts.
 
-### 4. Coverage-hole debug view — days
+### 4. Coverage-hole debug view — DONE 2026-09-06
 
-Split "no data" from "filled" in one glance: visualize invalid
-warpdepth distinctly from stretched pixels (`DEBUG_SHOW_STRETCH`
-shows the latter; holes are currently only visible as magenta under
-`DEBUG_DEPTH_AS_COLOR`). Needed to judge items 5–6 honestly. Files:
-`openwarp.comp:350-671`, `render_interface.h`
-(`RENDER_OPENWARP_DEBUG_*`), debug GUI panel.
+New `RENDER_OPENWARP_DEBUG_SHOW_HOLES` bit (1u<<8) + `DEBUG_SHOW_HOLES`
+in `openwarp.comp`: pixels with no valid warp depth — even after the
+stretch search — paint solid red, distinct from stretch-filled (green)
+and occlusion rejects (magenta); `DEPTH_AS_COLOR` behavior unchanged.
+Plumbed end to end: `render_interface.h` define, `comp_compositor.h`
+`show_holes`, `MONADO_OPENWARP_SHOW_HOLES` env default, GUI checkbox
+("Highlight coverage holes (red)"), `comp_renderer.c` flag packing.
+Verified: full build clean, shader glslangValidator-clean, live
+service + playground FOCUSED with `SHOW_HOLES=1` (+`DISABLE_STRETCH=1`
+to force the new branch widely taken) under validation layers — 0
+validation errors. Pixel-level confirmation pending sandbox capture
+repair; until then judge holes-vs-filled with this view + the
+`DEPTH_AS_COLOR` magenta cross-check.
 
 ### 5. Coverage channel from MSAA depth — weeks
 

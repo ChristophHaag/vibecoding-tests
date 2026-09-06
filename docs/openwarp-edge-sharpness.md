@@ -1146,6 +1146,19 @@ whole-scene inversion into a one-line diagnosis. The matrix pins the
 current behavior, so a future fix arrives with a failing-then-passing
 test.
 
+## 2026-09-06 follow-up: fidelity-plan item 4 (coverage-hole debug view) — done
+
+New `RENDER_OPENWARP_DEBUG_SHOW_HOLES` bit + shader branch: true
+coverage holes paint solid red, distinct from stretch green and
+occlusion magenta; `DEPTH_AS_COLOR` behavior unchanged. Plumbed end to
+end (env `MONADO_OPENWARP_SHOW_HOLES`, GUI checkbox, flag packing) and
+documented in `monado/doc/openwarp_integration.md` + the stale-capture
+attribution list. Verified: full build clean, shader
+glslangValidator-clean, live service + playground FOCUSED with
+`SHOW_HOLES=1` and `DISABLE_STRETCH=1` (forces the new branch widely
+taken) under validation layers — 0 validation errors over a 20 s run.
+Pixel-level confirmation pending the sandbox capture repair.
+
 ## 2026-09-06 follow-up: fidelity-plan item 1 (agreement-weighted warp taps) — tested, rejected
 
 Candidate: on the disagreement path, when the occlusion test does not
