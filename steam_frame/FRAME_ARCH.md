@@ -62,6 +62,17 @@ python3 frame_arch.py enter work -- sudo pacman -Syu
 python3 frame_arch.py enter work -- firefox
 ```
 
+Every entry (shell or command) sets `MESA_LOADER_DRIVER_OVERRIDE=zink` and
+`GALLIUM_DRIVER=zink`, so OpenGL applications run through Vulkan.
+
+`list` prints environment names, one per line. `enter` without a name uses the
+first one (sorted), also over SSH:
+
+```sh
+python3 frame_arch.py list
+python3 frame_arch.py enter -- uname -m     # first environment
+```
+
 Exiting the shell **does not stop the container or lock an encrypted home**.
 Use `stop` explicitly. `enter` asks for the encryption passphrase only while the
 home is locked; `create` also asks for confirmation.
@@ -103,6 +114,14 @@ framearch() {
     --ssh-option UserKnownHostsFile="$PWD/ssh_hosts" \
     --ssh-option GlobalKnownHostsFile="$HOME/ssh_hosts_global" "$@"
 }
+```
+
+From a PC, `sync [status|push|pull]` compares or copies `frame_arch.py` and
+`FRAME_ARCH.md` to/from the Frame's home directory (`--ssh` required):
+
+```sh
+framearch sync          # same / DIFFERENT / remote-missing
+framearch sync push
 ```
 
 Encryption can also read **one passphrase line** from stdin with the global

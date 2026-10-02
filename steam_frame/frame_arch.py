@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import fcntl
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,9 @@ DESKTOP_KEYS = (
     "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE",
     "PULSE_SERVER", "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE",
 )
+# OpenGL through Vulkan; set for every entry (shell or command).
+GRAPHICS_ENV = {"MESA_LOADER_DRIVER_OVERRIDE": "zink", "GALLIUM_DRIVER": "zink"}
+SYNC_FILES = ("frame_arch.py", "FRAME_ARCH.md")
 IMAGE = "localhost/frame-arch:base"
 SEED_IMAGE = "localhost/frame-arch:bootstrap"
 MARKER = "environment.json"
@@ -631,7 +635,7 @@ class Environment:
         arguments = ["exec", "--interactive"]
         if sys.stdin.isatty() and sys.stdout.isatty():
             arguments += ["--tty"]
-        for key, value in desktop.items():
+        for key, value in {**desktop, **GRAPHICS_ENV}.items():
             arguments += ["--env", f"{key}={value}"]
         if not command:
             shell = self.login_shell()
@@ -642,7 +646,17 @@ class Environment:
         return result.returncode
 
 
-def remote(args):
+def list_environments(root):
+    parent = Path(root)
+    if not parent.is_dir():
+        return []
+    return sorted(
+        entry.name for entry in parent.iterdir()
+        if NAME_PATTERN.fullmatch(entry.name) and (entry / MARKER).is_file()
+    )
+
+
+def ssh_options(args):
     options = ["ssh", "-x"]
     if args.identity:
         options += ["-i", str(Path(args.identity).expanduser())]
@@ -650,14 +664,68 @@ def remote(args):
         options += ["-o", option]
     if args.ssh.startswith("-"):
         raise Error("Invalid SSH destination")
+    return options
+
+
+def remote_root(args):
     if args.root is None:
-        directory = '"$HOME"/.local/share/frame-arch/' + shlex.quote(args.name)
-    elif args.root.startswith("~/"):
-        directory = '"$HOME"/' + shlex.quote(args.root[2:] + "/" + args.name)
-    elif args.root.startswith("/"):
-        directory = shlex.quote(args.root.rstrip("/") + "/" + args.name)
+        return '"$HOME"/.local/share/frame-arch'
+    if args.root.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(args.root[2:].rstrip("/"))
+    if args.root.startswith("/"):
+        return shlex.quote(args.root.rstrip("/"))
+    raise Error("SSH --root must be absolute or start with ~/")
+
+
+def remote_list(args):
+    script = (
+        f'for d in {remote_root(args)}/*/; do '
+        '[ -f "${d}environment.json" ] && basename "$d"; done | LC_ALL=C sort'
+    )
+    result = run([*ssh_options(args), args.ssh, script], capture_output=True, text=True)
+    return [name for name in result.stdout.split() if NAME_PATTERN.fullmatch(name)]
+
+
+def remote_sync(args):
+    options = ssh_options(args)
+    here = Path(__file__).resolve().parent
+    names = " ".join(SYNC_FILES)
+    if args.mode == "push":
+        archive = subprocess.run(["tar", "-C", str(here), "-cf", "-", *SYNC_FILES], check=True, capture_output=True).stdout
+        run([*options, args.ssh, 'umask 077; tar -C "$HOME" -xf -'], input=archive)
+        print(f"pushed: {names}")
+    elif args.mode == "pull":
+        archive = run([*options, args.ssh, f'cd "$HOME" && tar -cf - {names}'], capture_output=True).stdout
+        subprocess.run(["tar", "-C", str(here), "-xf", "-"], input=archive, check=True)
+        print(f"pulled: {names}")
     else:
-        raise Error("SSH --root must be absolute or start with ~/")
+        sums = run([*options, args.ssh, f'cd "$HOME" && sha256sum {names} 2>/dev/null || true'], capture_output=True, text=True).stdout
+        remote_sums = {line.split()[1]: line.split()[0] for line in sums.splitlines() if len(line.split()) == 2}
+        for name in SYNC_FILES:
+            local = hashlib.sha256((here / name).read_bytes()).hexdigest() if (here / name).is_file() else None
+            if name not in remote_sums:
+                state = "remote-missing"
+            elif local is None:
+                state = "local-missing"
+            else:
+                state = "same" if local == remote_sums[name] else "DIFFERENT"
+            print(f"{state:15} {name}")
+    return 0
+
+
+def remote(args):
+    options = ssh_options(args)
+    if args.action == "list":
+        print("\n".join(remote_list(args)))
+        return 0
+    if args.action == "sync":
+        return remote_sync(args)
+    if args.action == "enter" and args.name is None:
+        names = remote_list(args)
+        if not names:
+            raise Error("No environments found")
+        args.name = names[0]
+    directory = remote_root(args) + "/" + shlex.quote(args.name)
     if not NAME_PATTERN.fullmatch(args.name):
         raise Error("Invalid environment name")
     staging = (
@@ -698,8 +766,11 @@ def parse_args(argv=None):
     create.add_argument("--home", choices=("shared", "private", "encrypted"), default="shared")
     create.add_argument("--storage-driver", choices=("overlay", "vfs"), default="overlay")
     enter = commands.add_parser("enter", help="Enter a shell or run a command")
-    enter.add_argument("name")
-    enter.add_argument("command", nargs=argparse.REMAINDER)
+    enter.add_argument("rest", nargs=argparse.REMAINDER, metavar="[NAME] [-- COMMAND...]",
+                       help="Environment name (default: first listed), then an optional command")
+    commands.add_parser("list", help="List environment names, one per line")
+    sync = commands.add_parser("sync", help="Compare/copy this script and its docs to/from the Frame's home (needs --ssh)")
+    sync.add_argument("mode", nargs="?", choices=("status", "push", "pull"), default="status")
     commands.add_parser("stop", help="Stop the container and lock an encrypted home").add_argument("name")
     remove = commands.add_parser("remove", help="Stop and delete this environment's directory")
     remove.add_argument("name")
@@ -708,8 +779,12 @@ def parse_args(argv=None):
     mount_host.add_argument("name")
     mount_host.add_argument("--yes", action="store_true", help="Confirm recreation and stopping active sessions")
     args = parser.parse_args(argv)
-    if args.action == "enter" and args.command[:1] == ["--"]:
-        args.command = args.command[1:]
+    if args.action == "enter":
+        rest = args.rest
+        args.name = rest.pop(0) if rest and rest[0] != "--" else None
+        if rest[:1] == ["--"]:
+            rest = rest[1:]
+        args.command = rest
     return args
 
 
@@ -720,6 +795,8 @@ def main(argv=None):
         return remote(args)
     if args.identity or args.ssh_option:
         raise Error("SSH options require --ssh")
+    if args.action == "sync":
+        raise Error("sync requires --ssh")
     if os.getuid() == 0:
         raise Error("Run as the desktop user, not root")
     if platform.machine() != "aarch64":
@@ -733,6 +810,14 @@ def main(argv=None):
         if not shutil.which(tool):
             raise Error(f"Missing host prerequisite: {tool}")
     root = args.root or str(Path.home() / ".local/share/frame-arch")
+    if args.action == "list":
+        print("\n".join(list_environments(root)))
+        return 0
+    if args.action == "enter" and args.name is None:
+        names = list_environments(root)
+        if not names:
+            raise Error("No environments found")
+        args.name = names[0]
     environment = Environment(root, args.name)
     if args.action == "create":
         environment.create(args.home, args.storage_driver, args.passphrase_stdin)

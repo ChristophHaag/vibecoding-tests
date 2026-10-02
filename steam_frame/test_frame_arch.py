@@ -118,5 +118,33 @@ class RuntimeCleanupTests(unittest.TestCase):
         self.assertEqual(environment["CONTAINERS_CONF"], str(self.directory / "containers.conf"))
 
 
+class EnterArgumentTests(unittest.TestCase):
+    def parse(self, *words):
+        return frame_arch.parse_args(["enter", *words])
+
+    def test_name_and_command_are_optional(self):
+        for words, name, command in (
+            ([], None, []),
+            (["--", "ls", "-l"], None, ["ls", "-l"]),
+            (["work"], "work", []),
+            (["work", "--", "ls", "-l"], "work", ["ls", "-l"]),
+        ):
+            args = self.parse(*words)
+            self.assertEqual((args.name, args.command), (name, command))
+
+    def test_list_environments_is_sorted_and_requires_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name, marked in (("b", True), ("a", True), ("partial", False)):
+                (Path(root) / name).mkdir()
+                if marked:
+                    (Path(root) / name / frame_arch.MARKER).write_text("{}")
+            self.assertEqual(frame_arch.list_environments(root), ["a", "b"])
+
+    def test_zink_is_forced_on_every_entry(self):
+        self.assertEqual(frame_arch.GRAPHICS_ENV, {
+            "MESA_LOADER_DRIVER_OVERRIDE": "zink", "GALLIUM_DRIVER": "zink",
+        })
+
+
 if __name__ == "__main__":
     unittest.main()
